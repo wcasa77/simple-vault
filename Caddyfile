@@ -1,0 +1,3 @@
+{$VAULT_DOMAIN:vault.example.com} {
+	reverse_proxy vault:3100
+}
