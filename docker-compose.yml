@@ -22,6 +22,8 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy-data:/data
       - caddy-config:/config
+    environment:
+      - VAULT_DOMAIN=${VAULT_DOMAIN}
     depends_on:
       - vault
 
