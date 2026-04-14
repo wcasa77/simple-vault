@@ -1,3 +1,8 @@
 {$VAULT_DOMAIN:vault.example.com} {
-	reverse_proxy vault:3100
+	reverse_proxy vault:3100 {
+		# When behind Cloudflare (or any proxy), prefer the real client IP
+		# from CF-Connecting-IP so the vault's IP allowlist sees the end user
+		# rather than an edge IP. Harmless when no proxy is in front.
+		header_up X-Forwarded-For {http.request.header.CF-Connecting-IP}
+	}
 }
