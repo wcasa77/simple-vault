@@ -168,6 +168,11 @@ app.post('/secrets/:name', auth, (req, res) => {
   if (!validName(name)) return res.status(400).json({ error: 'Invalid name. Use alphanumeric, dash, underscore, dot.' });
   const { value } = req.body;
   if (!value) return res.status(400).json({ error: 'value is required' });
+  if (typeof value !== 'string') {
+    return res.status(400).json({
+      error: 'value must be a string. For binary data (keys, certs, images), base64-encode on the client first.'
+    });
+  }
   fs.mkdirSync(SECRETS_DIR, { recursive: true });
   const envelope = encrypt(value, req.vaultPassword);
   fs.writeFileSync(secretPath(name), JSON.stringify(envelope, null, 2));

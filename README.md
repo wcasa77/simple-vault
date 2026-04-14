@@ -170,6 +170,63 @@ Restricted to `a-z A-Z 0-9 . _ -`. Use hierarchical names with dots or dashes
 to keep things organised, e.g. `prod.db-password`, `stripe.api-key`,
 `github.deploy-key`.
 
+## Storing file contents (SSH keys, certificates, PEM files)
+
+The `value` field must be a JSON **string**. Plain text (passwords, API keys,
+single-line tokens) works directly. For **anything with newlines, binary bytes,
+or shell-special characters** — SSH private keys, TLS certs, `.pfx` bundles,
+GPG keys, service-account JSONs — wrap the bytes in base64 first.
+
+Why: some clients (notably Windows PowerShell's `ConvertTo-Json` with
+multi-line strings) silently serialise the value as an object, which the
+server will reject. Base64 is a single-line ASCII string — no ambiguity, no
+encoding drift, byte-exact round-trip.
+
+### Bash / Linux / macOS / WSL
+
+```bash
+# Store
+B64=$(base64 -w0 ~/.ssh/id_ed25519)
+curl -X POST https://vault.example.com/secrets/ssh.myhost.id_ed25519 \
+  -H "x-vault-token: $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"value\":\"$B64\"}"
+
+# Restore
+curl -s https://vault.example.com/secrets/ssh.myhost.id_ed25519 \
+  -H "x-vault-token: $TOKEN" \
+  | jq -r .value | base64 -d > ~/.ssh/id_ed25519
+chmod 600 ~/.ssh/id_ed25519
+ssh-keygen -lf ~/.ssh/id_ed25519       # fingerprint sanity check
+```
+
+### Windows PowerShell
+
+```powershell
+# Store
+$b64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes("$HOME\.ssh\id_ed25519"))
+Invoke-RestMethod -Method Post -Uri https://vault.example.com/secrets/ssh.myhost.id_ed25519 `
+  -Headers $h -ContentType 'application/json' `
+  -Body (@{value=$b64} | ConvertTo-Json)
+
+# Restore
+$b64 = (Invoke-RestMethod -Uri https://vault.example.com/secrets/ssh.myhost.id_ed25519 -Headers $h).value
+[System.IO.File]::WriteAllBytes("$HOME\.ssh\id_ed25519", [Convert]::FromBase64String($b64))
+icacls $HOME\.ssh\id_ed25519 /inheritance:r /grant:r "${env:USERNAME}:(R,W)" | Out-Null
+ssh-keygen -lf $HOME\.ssh\id_ed25519   # fingerprint sanity check
+```
+
+### Verifying byte-exact round-trip
+
+After storing, fetch and decode, then compare to the original. If the
+fingerprints match, the round-trip is byte-perfect:
+
+```bash
+ssh-keygen -lf ~/.ssh/id_ed25519                            # original
+curl -s https://vault.example.com/secrets/ssh.myhost.id_ed25519 \
+  -H "x-vault-token: $TOKEN" | jq -r .value | base64 -d \
+  | ssh-keygen -lf /dev/stdin                               # from vault
+```
+
 ## Using with AI agents, CI jobs, and scripts
 
 Core idea: **API keys live in the vault, and short-lived processes fetch them
