@@ -170,6 +170,149 @@ Restricted to `a-z A-Z 0-9 . _ -`. Use hierarchical names with dots or dashes
 to keep things organised, e.g. `prod.db-password`, `stripe.api-key`,
 `github.deploy-key`.
 
+## Using with AI agents, CI jobs, and scripts
+
+Core idea: **API keys live in the vault, and short-lived processes fetch them
+at runtime.** No plaintext `.env` files on laptops, no keys pasted into AI
+chat windows, no secrets committed by accident.
+
+Three integration levels — pick whichever matches your threat model.
+
+### Level 1 — Paste a session token into the agent
+
+Simplest. You unlock the vault, paste the token into your AI chat (Claude
+Code, Cursor, Aider, plain ChatGPT with shell tools, etc.), and the agent
+uses it via `curl` for the session.
+
+```
+You:   My vault token is a66abe62...
+You:   Fetch the github-pat secret and clone repo X
+Agent: [runs curl with the token, uses the value in subsequent commands]
+```
+
+**Tradeoffs:**
+- The token lives in the chat's history for its 30-minute TTL (auto-extends
+  on activity). If you export/share that chat while the token is still valid,
+  that's a compromise.
+- The agent has access to **every** secret for the session, not just the one
+  you asked about.
+- Always `/lock` when done.
+
+Fine for a one-shot task in a chat you won't share. Don't use for routine work.
+
+### Level 2 — Shell wrapper functions (recommended)
+
+Secrets are fetched *inside a subprocess* and never appear in the chat.
+One password prompt per 30-min session covers any number of fetches.
+
+**Bash** — add to `~/.bashrc`:
+
+```bash
+vault_unlock() {
+  read -rsp "Vault password: " pw; echo
+  export VAULT_TOKEN=$(curl -s -X POST https://vault.example.com/unlock \
+    -H 'Content-Type: application/json' \
+    -d "{\"password\":\"$pw\"}" | jq -r .token)
+  unset pw
+  [ -n "$VAULT_TOKEN" ] && [ "$VAULT_TOKEN" != "null" ] \
+    && echo "Unlocked" || { echo "Failed"; unset VAULT_TOKEN; }
+}
+
+vault_get() {
+  curl -s "https://vault.example.com/secrets/$1" \
+    -H "x-vault-token: $VAULT_TOKEN" | jq -r .value
+}
+
+# Run a command with a secret injected as an env var.
+# Example: vault_run github-pat gh issue list
+#   -> GITHUB_PAT=<fetched> gh issue list
+vault_run() {
+  local name=$1; shift
+  local var
+  var=$(echo "$name" | tr 'a-z.-' 'A-Z__')
+  env "$var=$(vault_get "$name")" "$@"
+}
+
+vault_lock() {
+  curl -s -X POST https://vault.example.com/lock \
+    -H "x-vault-token: $VAULT_TOKEN" >/dev/null
+  unset VAULT_TOKEN
+}
+```
+
+Usage:
+```bash
+vault_unlock                        # one prompt
+claude                              # or cursor / aider / your AI CLI
+# ...then inside the agent's shell:
+vault_run github-pat bash -c 'git clone https://$GITHUB_PAT@github.com/user/repo'
+# Token stays in the parent shell; secret value exists only inside that bash -c
+```
+
+**PowerShell** — add to `$PROFILE`:
+
+```powershell
+function Vault-Unlock {
+    $pw = Read-Host "Vault password" -AsSecureString
+    $plain = [System.Net.NetworkCredential]::new('', $pw).Password
+    $global:VAULT_TOKEN = (Invoke-RestMethod -Method Post `
+        -Uri https://vault.example.com/unlock `
+        -ContentType 'application/json' `
+        -Body (@{password=$plain} | ConvertTo-Json)).token
+    $plain = $null
+    if ($global:VAULT_TOKEN) { "Unlocked" } else { "Failed" }
+}
+
+function Vault-Get ($name) {
+    (Invoke-RestMethod -Uri "https://vault.example.com/secrets/$name" `
+        -Headers @{"x-vault-token"=$global:VAULT_TOKEN}).value
+}
+
+function Vault-Lock {
+    Invoke-RestMethod -Method Post -Uri https://vault.example.com/lock `
+        -Headers @{"x-vault-token"=$global:VAULT_TOKEN} | Out-Null
+    $global:VAULT_TOKEN = $null
+}
+```
+
+Usage:
+```powershell
+Vault-Unlock
+$env:ANTHROPIC_API_KEY = Vault-Get 'anthropic.api-key'
+claude                              # launches with the key in its env
+Vault-Lock                          # when done
+```
+
+### Level 3 — MCP server (tightest, per-secret approval)
+
+For MCP-compatible hosts (Claude Code, Cursor, etc.), wrap the vault as an
+MCP server so each secret read becomes an explicit tool call the user
+approves in the UI. Sketch:
+
+```js
+// vault-mcp.js — register in ~/.claude.json under "mcpServers"
+// Expects env: VAULT_URL, VAULT_TOKEN (from Level 2's vault_unlock)
+// Implements tools: vault.list, vault.get <name>
+// See https://modelcontextprotocol.io/ for the full stdio protocol.
+```
+
+Tradeoffs vs. Level 2:
+- **Pro:** every fetch surfaces as an approval prompt with a visible audit log
+- **Con:** ~50 LoC of Node + MCP registration; still needs a token from
+  Level 2's `vault_unlock` to authenticate to the vault
+
+An out-of-the-box MCP server isn't bundled with this repo yet — PRs welcome.
+
+### Common anti-patterns
+
+| Don't | Why |
+|-------|-----|
+| Paste secret **values** into the AI chat | Ends up in context window, logs, exports |
+| Store the master password *in the vault* | Circular; doesn't protect anything |
+| Write `$VAULT_TOKEN` to disk | Persists past session TTL; defeats the 30-min design |
+| Use one vault across unrelated projects | Blast radius of a single leak is "everything" |
+| Let the agent call `/init` | Idempotent = no; re-init on an initialised vault fails, but if the volume's empty the agent could initialise it with a password only the agent knows |
+
 ## Behind Cloudflare
 
 If you proxy the domain through Cloudflare (orange cloud):
