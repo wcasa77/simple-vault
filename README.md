@@ -8,6 +8,18 @@ or Bitwarden. Think "password-protected encrypted blob store you can `curl`."
 
 ## Features
 
+- **Web UI** at `/ui/` — signup wizard, login, dashboard, per-secret detail
+  view, settings page, and a one-click **AI prompt helper** that builds a
+  paste-ready block for Claude / ChatGPT / Cursor etc.
+- **2FA (TOTP)** — optional time-based codes on top of the master password.
+  Set up during signup or later from Settings. Works with any standard
+  authenticator app (Google Authenticator, Authy, 1Password, etc.).
+- **One-time share links** — generate a URL (with TTL and view-count limit)
+  that anyone can open without a vault login. Stored in memory only, gone
+  on restart.
+- **Per-secret notes** — attach free-form context to each secret (target
+  hostname, username, usage hints). The notes are encrypted alongside the
+  value and are what the AI-prompt helper pastes as instructions to the LLM.
 - **AES-256-GCM** encryption with **PBKDF2** key derivation (100k iterations, SHA-512)
 - Password-based master key — the password itself is never stored, only a
   `vault-ok` canary encrypted with it, used to verify unlock attempts
@@ -15,7 +27,8 @@ or Bitwarden. Think "password-protected encrypted blob store you can `curl`."
 - In-memory rate limiting: 5 `/init` + `/unlock` attempts per IP per 15 min
 - Optional IP allowlist (works correctly behind Cloudflare via `CF-Connecting-IP`)
 - Fully Dockerized; Caddy handles Let's Encrypt certificates automatically
-- Small surface area: ~220 lines of Node.js, no client, no database
+- Small surface area: single Node.js file + a dependency-free static UI,
+  no database
 
 ## Architecture
 
@@ -102,12 +115,121 @@ curl https://vault.example.com/health
 **Pick a long random master password and save it in a password manager
 before running this. There is no recovery.**
 
+Two equivalent ways:
+
+**Option A — Web UI (recommended for humans).** Open
+`https://vault.example.com/` in a browser and follow the signup wizard.
+It walks you through:
+
+1. Setting the master password.
+2. *(optional)* Scanning a QR code to enable TOTP-based 2FA.
+3. Dropping straight into the dashboard where you can add, view, share,
+   and copy-to-AI-chat your secrets.
+
+**Option B — curl (for scripts / headless setup).**
+
 ```bash
 curl -X POST https://vault.example.com/init \
   -H 'Content-Type: application/json' \
   -d '{"password":"YOUR-LONG-RANDOM-MASTER-PASSWORD"}'
 # {"message":"Vault initialized"}
 ```
+
+Either way, the vault is ready after this step. 2FA set via the UI can
+be disabled again from Settings; you can always fall back to API-only
+access if you prefer.
+
+## Web UI
+
+The web UI lives at `https://vault.example.com/ui/` (the root `/` redirects
+there). It's a single static page served by the vault container — no build
+step, no external CDN. Everything you can do via the API you can do here,
+plus:
+
+- **Dashboard with search** across all secret names.
+- **Per-secret detail view** with show/hide on the value, editable notes,
+  a delete button, and a **"Copy AI prompt"** button.
+- **Share modal**: pick a TTL (1 h – 7 d) and max views (1 – 100), then
+  copy the generated URL. The recipient opens it in a browser and gets a
+  dark-themed page with the value, the notes, and a copy button. Once the
+  views run out (or the expiry passes, or the vault restarts) the link is
+  gone.
+- **Settings → 2FA** to enable or disable TOTP, and a **current session
+  token** display with a copy button so you can paste it straight into a
+  shell or an AI agent.
+
+### AI prompt helper
+
+Open any secret → pick one of the two **Copy AI prompt** buttons → paste
+into your AI chat.
+
+**Safe mode (default, recommended for SSH keys and anything sensitive).**
+The prompt gives the AI the vault URL, a short-lived session token, the
+*name* and *notes* of the secret, and Bash + PowerShell recipes — but
+**not the value**. The agent fetches the value itself via `curl` inside a
+subprocess and pipes it straight into `ssh` / `base64 -d` / `psql` /
+whatever, so the plaintext never appears in the chat text (and therefore
+never hits the AI provider's logs or training data).
+
+```
+I'm using Simple Vault (a self-hosted secrets manager) with a shell-capable AI
+(Claude Code / Cursor / Aider / etc.). I am giving you a short-lived session TOKEN
+so you can fetch the secret yourself — the VALUE is intentionally NOT in this chat,
+so it doesn't land in the AI provider's logs.
+
+=== Vault Connection ===
+URL:         https://vault.example.com
+Session token (30-min TTL, auto-extends on activity):
+  <SESSION_TOKEN>
+
+=== What I want you to do ===
+Use the secret named: ssh.staging.id_ed25519
+Notes:
+  SSH private key (base64-encoded)
+  Host: 203.0.113.10
+  User: administrator
+  Port: 22
+
+=== Security rules — please follow strictly ===
+- DO NOT print, echo, cat, or log the secret value anywhere in your replies.
+- Fetch it INSIDE a command pipeline so the value stays in subprocess
+  stdin/stdout and never ends up in the chat text.
+...
+
+=== Recipes ===
+# Bash — SSH private key stored base64-encoded
+TOKEN='<TOKEN>'; URL='https://vault.example.com'; NAME='ssh.staging.id_ed25519'
+curl -s "$URL/secrets/$NAME" -H "x-vault-token: $TOKEN" \
+  | jq -r .value | base64 -d > /tmp/svkey && chmod 600 /tmp/svkey
+ssh -i /tmp/svkey -o IdentitiesOnly=yes <USER>@<HOST>   # USER/HOST from Notes
+shred -u /tmp/svkey 2>/dev/null || rm -f /tmp/svkey
+
+# PowerShell — SSH private key stored base64-encoded
+$h = @{"x-vault-token"='<TOKEN>'}
+$v = (Invoke-RestMethod -Uri 'https://vault.example.com/secrets/ssh.staging.id_ed25519' -Headers $h).value
+$key = Join-Path $env:TEMP 'svkey'
+[IO.File]::WriteAllBytes($key, [Convert]::FromBase64String($v))
+icacls $key /inheritance:r /grant:r "$($env:USERNAME):R" | Out-Null
+ssh -i $key -o IdentitiesOnly=yes <USER>@<HOST>
+Remove-Item $key -Force
+...
+```
+
+That's enough for an agent to go straight to `ssh administrator@203.0.113.10`
+on the first try — no "try ubuntu, try root, try redis" guessing loop — as
+long as you've filled in the **Notes** field. The detail view shows a
+warning when notes are empty and offers one-click templates (**SSH key**,
+**SSH pw**, **DB**, **API token**, **Cert**) that drop a structured
+skeleton into the textarea for you to edit.
+
+**Inline value mode.** A second button, `with value`, includes the raw
+value in the prompt. It's quicker for non-sensitive material (a throwaway
+demo API key, config snippets) but the value lands in the AI provider's
+chat history. The UI pops a confirmation dialog before copying.
+
+> TL;DR: always paste the **safe** variant for SSH keys, certs, database
+> passwords, long-lived API tokens. Save the **inline** variant for
+> genuinely low-stakes values where convenience matters.
 
 ## Using the API
 
@@ -458,29 +580,51 @@ the decryption key via PBKDF2 with the same salts stored in the tarball.
 
 ## API reference
 
-| Method | Path              | Auth | Body              | Notes                                 |
-| ------ | ----------------- | ---- | ----------------- | ------------------------------------- |
-| GET    | `/health`         | no   | —                 | Readiness / init status               |
-| POST   | `/init`           | no\* | `{ "password" }`  | One-shot; 5 / 15 min rate limit       |
-| POST   | `/unlock`         | no\* | `{ "password" }`  | Returns 30-min token; rate limited    |
-| POST   | `/lock`           | no   | —                 | Invalidates the session token         |
-| GET    | `/secrets`        | yes  | —                 | List names                            |
-| POST   | `/secrets/:name`  | yes  | `{ "value" }`     | Create / overwrite                    |
-| GET    | `/secrets/:name`  | yes  | —                 | Read                                  |
-| DELETE | `/secrets/:name`  | yes  | —                 | Delete                                |
+| Method | Path                      | Auth | Body                                                        | Notes                                                    |
+| ------ | ------------------------- | ---- | ----------------------------------------------------------- | -------------------------------------------------------- |
+| GET    | `/health`                 | no   | —                                                           | Readiness, init status, `totp` flag, vault name          |
+| POST   | `/init`                   | no\* | `{ "password" }`                                            | One-shot; 5 / 15 min rate limit                          |
+| POST   | `/unlock`                 | no\* | `{ "password", "totp"? }`                                   | Returns 30-min token; `totp` required if 2FA enabled     |
+| POST   | `/lock`                   | no   | —                                                           | Invalidates the session token                            |
+| GET    | `/info`                   | yes  | —                                                           | Vault URL / name / description (for AI-prompt helper)    |
+| GET    | `/secrets`                | yes  | —                                                           | List names                                               |
+| POST   | `/secrets/:name`          | yes  | `{ "value", "notes"? }`                                     | Create / overwrite; `notes` is optional free-form text   |
+| GET    | `/secrets/:name`          | yes  | —                                                           | Read; returns `{ name, value, notes }`                   |
+| DELETE | `/secrets/:name`          | yes  | —                                                           | Delete                                                   |
+| POST   | `/secrets/:name/share`    | yes  | `{ "ttl_seconds"?, "max_views"?, "include_notes"? }`        | Create one-time share link (in-memory, non-persistent)   |
+| GET    | `/shared/:token`          | no   | —                                                           | Retrieve share; HTML by default, JSON on `Accept: application/json`. Consumes one view. |
+| POST   | `/2fa/setup`              | yes  | `{ "label"? }`                                              | Generate pending TOTP secret; returns base32 + QR data-URL |
+| POST   | `/2fa/confirm`            | yes  | `{ "totp" }`                                                | Activate 2FA after scanning the QR                       |
+| POST   | `/2fa/disable`            | yes  | `{ "totp" }`                                                | Disable 2FA (requires a valid current code)              |
+| GET    | `/ui/`                    | no   | —                                                           | Static web UI (SPA)                                      |
 
 \* Rate-limited per IP. Authed routes require `x-vault-token: <token>`.
 
 Password minimum length at `/init` is 8 characters — you should use at least 20.
 
+### Share-link options
+
+`POST /secrets/:name/share` body fields, all optional:
+
+| Field             | Default | Max      | Meaning                                                |
+| ----------------- | ------- | -------- | ------------------------------------------------------ |
+| `ttl_seconds`     | 86400   | 604800   | How long the share stays valid (1 day default, 7 d max) |
+| `max_views`       | 1       | 100      | How many times the URL can be opened before it expires  |
+| `include_notes`   | `true`  | —        | If `false`, the notes field is omitted from the share   |
+
+Shares are stored **in memory only**. A vault container restart invalidates
+every active share.
+
 ## Configuration reference
 
-| Variable                | Default      | Description                                           |
-| ----------------------- | ------------ | ----------------------------------------------------- |
-| `VAULT_DOMAIN`          | *(required)* | Domain for Caddy TLS (Let's Encrypt)                  |
-| `ALLOWED_IPS`           | *(empty)*    | Comma-separated client IPs allowed (empty = any)      |
-| `VAULT_DATA`            | `/data`      | Data directory inside the container                   |
-| `PORT`                  | `3100`       | Internal listen port (not exposed to host)            |
+| Variable                | Default         | Description                                                          |
+| ----------------------- | --------------- | -------------------------------------------------------------------- |
+| `VAULT_DOMAIN`          | *(required)*    | Domain for Caddy TLS (Let's Encrypt)                                 |
+| `ALLOWED_IPS`           | *(empty)*       | Comma-separated client IPs allowed (empty = any)                     |
+| `VAULT_NAME`            | `Simple Vault`  | Display name in the web UI and TOTP authenticator app                |
+| `VAULT_DESCRIPTION`     | *(empty)*       | Free-form text pasted into the AI-prompt helper as `Environment: …`  |
+| `VAULT_DATA`            | `/data`         | Data directory inside the container                                  |
+| `PORT`                  | `3100`          | Internal listen port (not exposed to host)                           |
 
 ## Troubleshooting
 
@@ -541,12 +685,22 @@ For `.env` changes that affect both services, omit the service name.
 - **Hobby-grade.** Uses PBKDF2, not Argon2id. Single-node, no replication,
   no audit log, no secret rotation, no granular ACLs — one password unlocks
   everything.
-- **Memory-only sessions.** Restarting the vault container invalidates every
-  active token. This is a feature, not a bug — it cleanly closes sessions on
-  host reboot.
-- **No out-of-the-box key rotation.** To rotate the master password you'd
-  need to script read-all-with-old-password → re-encrypt-with-new. Not
-  currently included.
+- **2FA is optional but recommended.** When enabled, the TOTP secret is
+  encrypted with the master password (same envelope scheme as the `vault-ok`
+  canary) and stored in `vault.json`. A wrong password means TOTP never
+  decrypts, so 2FA cannot be bypassed by tampering with the meta file.
+- **Memory-only sessions and shares.** Restarting the vault container
+  invalidates every active token *and every outstanding share link*. This
+  is a feature, not a bug — it cleanly closes all remote access on host
+  reboot.
+- **Share links contain plaintext in server memory** until they expire,
+  are consumed, or the process exits. That's a deliberate trade-off for
+  the "open in any browser, no login needed" UX — if you need
+  end-to-end-only sharing, fall back to passing the value out of band and
+  skip the share feature.
+- **No out-of-the-box master-password rotation.** To rotate, script
+  read-all-with-old-password → re-encrypt-with-new → swap the `verify` and
+  `totp` envelopes. Not currently included.
 - **Rate limit counter is in-memory.** A restart resets it. That's fine for
   most threat models but means a determined attacker who can force restarts
   has unlimited tries.
@@ -562,9 +716,13 @@ For `.env` changes that affect both services, omit the service name.
 ├── Caddyfile                      Caddy reverse-proxy config + CF header handling
 ├── docker-compose.yml             Two-container stack (vault + caddy)
 ├── Dockerfile                     node:20-alpine build for the vault
-├── .env.example                   Template for VAULT_DOMAIN + ALLOWED_IPS
-├── package.json                   Single dependency: express
-├── server.js                      The entire vault — ~220 lines
+├── .env.example                   Template for VAULT_DOMAIN / ALLOWED_IPS / VAULT_NAME / VAULT_DESCRIPTION
+├── package.json                   Dependencies: express + qrcode
+├── server.js                      The entire vault API + TOTP + shares (single file)
+├── public/                        Zero-build static web UI
+│   ├── index.html
+│   ├── styles.css
+│   └── app.js
 └── scripts/
     └── setup-hardening.sh         Firewall + backup + CF-refresh automation
 ```
