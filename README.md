@@ -139,6 +139,24 @@ Either way, the vault is ready after this step. 2FA set via the UI can
 be disabled again from Settings; you can always fall back to API-only
 access if you prefer.
 
+### Upgrading an existing install
+
+Pulling in a new release:
+
+```bash
+cd /opt/simple-vault     # wherever you cloned it
+git pull
+docker compose up -d --build vault
+# verify
+curl -sS https://vault.example.com/health
+```
+
+The `vault-data` Docker volume is untouched by `--build`, so your master
+password, all stored secrets, and (if enabled) your TOTP configuration
+survive the upgrade. Active session tokens are wiped — they're in-memory
+only — so log in again after the restart. Caddy is not rebuilt (it has
+no code changes), so your Let's Encrypt cert stays intact.
+
 ## Web UI
 
 The web UI lives at `https://vault.example.com/ui/` (the root `/` redirects
@@ -164,6 +182,60 @@ plus:
 - **Settings → 2FA** to enable or disable TOTP, and a **current session
   token** display with a copy button so you can paste it straight into a
   shell or an AI agent.
+
+### Generate an SSH keypair
+
+On the new-secret form, click **+ Generate SSH keypair** next to the
+Name field. The vault generates an ed25519 keypair server-side (pure Node,
+no shell-out), hands it to your browser, and forgets it — the `/keygen`
+endpoint is stateless.
+
+End-to-end flow for *"give an AI agent SSH access to a brand-new server"*:
+
+1. **Open the web UI → + New secret → + Generate SSH keypair.** Enter an
+   optional comment (defaults to `vault-<date>@<your-vault-host>`). That
+   comment is what appears beside the key in `authorized_keys`, so name
+   it something you'll recognise later.
+
+2. **The form auto-fills:**
+   - **Name**: `ssh.<slug-of-comment>.id_ed25519`
+   - **Value**: base64-encoded OpenSSH private key
+   - **Notes**: a header with the full public key line, then the SSH-key
+     template with `Host:` / `User:` / `Port:` placeholders
+   - A green panel at the top of the page shows the public key with two
+     copy buttons: the raw line, and a POSIX one-liner for
+     `authorized_keys`.
+
+3. **Paste the public key onto the target server.** Click **Copy
+   authorized_keys one-liner**, SSH in as the target user (or paste
+   through a console), run it once. It's idempotent:
+
+   ```bash
+   mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
+     grep -qxF 'ssh-ed25519 AAAA… comment' ~/.ssh/authorized_keys 2>/dev/null || \
+     echo 'ssh-ed25519 AAAA… comment' >> ~/.ssh/authorized_keys && \
+     chmod 600 ~/.ssh/authorized_keys
+   ```
+
+4. **Fill in Host / User / Port in Notes**, then **Save**. The private
+   key is encrypted with your master password and written to disk like
+   any other secret.
+
+5. **In your next AI session:** click the secret → **Copy AI prompt
+   (safe)** → paste into Claude Code / Cursor / Aider. The agent fetches
+   the private key into a subprocess, pipes it into `ssh`, and connects
+   on the first try — no guessing `ubuntu` / `root` / `admin`, because
+   your Notes field told it exactly who and where to connect as.
+
+> **Where does the private key live during all this?** Only in your
+> browser's form state between steps 2 and 4. The server's `/keygen`
+> endpoint never persists it, never logs it. It only touches disk after
+> Save, encrypted with your master password.
+
+Rotating an existing key is the same flow: delete the old secret, create
+a new one with **+ Generate SSH keypair**, paste the new public key onto
+the target host, and optionally remove the old line from
+`authorized_keys`.
 
 ### AI prompt helper
 
