@@ -154,6 +154,13 @@ plus:
   dark-themed page with the value, the notes, and a copy button. Once the
   views run out (or the expiry passes, or the vault restarts) the link is
   gone.
+- **Generate SSH keypair** button on the new-secret form: the vault
+  creates an ed25519 keypair server-side (pure Node, OpenSSH format), pre-
+  fills the Value field with the base64-encoded private key, prepends the
+  public key to Notes along with the SSH-key template, and shows the
+  public key in a copy-ready panel with a one-liner to append it to
+  `~/.ssh/authorized_keys`. The vault never persists the keypair — it only
+  lives in your browser until you hit Save.
 - **Settings → 2FA** to enable or disable TOTP, and a **current session
   token** display with a copy button so you can paste it straight into a
   shell or an AI agent.
@@ -596,6 +603,7 @@ the decryption key via PBKDF2 with the same salts stored in the tarball.
 | POST   | `/2fa/setup`              | yes  | `{ "label"? }`                                              | Generate pending TOTP secret; returns base32 + QR data-URL |
 | POST   | `/2fa/confirm`            | yes  | `{ "totp" }`                                                | Activate 2FA after scanning the QR                       |
 | POST   | `/2fa/disable`            | yes  | `{ "totp" }`                                                | Disable 2FA (requires a valid current code)              |
+| POST   | `/keygen`                 | yes  | `{ "type"?, "comment"? }`                                   | Generate ed25519 SSH keypair server-side. Returns public line + OpenSSH PEM + base64. **Stateless** — vault does NOT persist the output. |
 | GET    | `/ui/`                    | no   | —                                                           | Static web UI (SPA)                                      |
 
 \* Rate-limited per IP. Authed routes require `x-vault-token: <token>`.

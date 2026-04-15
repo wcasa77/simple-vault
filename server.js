@@ -174,6 +174,64 @@ function totpUri(secret, label, issuer) {
   return `otpauth://totp/${enc(issuer)}:${enc(label)}?secret=${secret}&issuer=${enc(issuer)}&algorithm=SHA1&digits=${TOTP_DIGITS}&period=${TOTP_PERIOD}`;
 }
 
+// --- SSH keypair generation (ed25519, OpenSSH format) ---
+// Pure Node — no shell-out, no new deps. Implements openssh-key-v1 per
+// https://github.com/openssh/openssh-portable/blob/master/PROTOCOL.key
+function sshString(buf) {
+  const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf, 'utf8');
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(b.length);
+  return Buffer.concat([len, b]);
+}
+
+function generateSshEd25519(comment = '') {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+  const pubJwk = publicKey.export({ format: 'jwk' });
+  const privJwk = privateKey.export({ format: 'jwk' });
+  const pub = Buffer.from(pubJwk.x, 'base64url');    // 32 bytes
+  const seed = Buffer.from(privJwk.d, 'base64url');   // 32 bytes
+  const priv = Buffer.concat([seed, pub]);            // 64 bytes: seed || pub
+
+  // SSH public-key line: "ssh-ed25519 <base64(wire)> [comment]"
+  const pubWire = Buffer.concat([sshString('ssh-ed25519'), sshString(pub)]);
+  const publicLine = `ssh-ed25519 ${pubWire.toString('base64')}${comment ? ' ' + comment : ''}`;
+
+  // OpenSSH v1 private-key blob
+  const check = crypto.randomBytes(4);
+  let privInner = Buffer.concat([
+    check, check,                                     // checkint1 == checkint2
+    sshString('ssh-ed25519'),
+    sshString(pub),
+    sshString(priv),
+    sshString(comment || '')
+  ]);
+  // Pad to the cipher block size (8 for "none")
+  const padLen = (8 - (privInner.length % 8)) % 8;
+  if (padLen > 0) {
+    const pad = Buffer.alloc(padLen);
+    for (let i = 0; i < padLen; i++) pad[i] = i + 1;
+    privInner = Buffer.concat([privInner, pad]);
+  }
+
+  const pubSection = Buffer.concat([sshString('ssh-ed25519'), sshString(pub)]);
+  const nkeys = Buffer.alloc(4); nkeys.writeUInt32BE(1);
+  const blob = Buffer.concat([
+    Buffer.from('openssh-key-v1\0', 'binary'),
+    sshString('none'),        // ciphername
+    sshString('none'),        // kdfname
+    sshString(''),            // kdfoptions
+    nkeys,                    // nkeys = 1
+    sshString(pubSection),
+    sshString(privInner)
+  ]);
+
+  const b64 = blob.toString('base64');
+  const wrapped = b64.match(/.{1,70}/g).join('\n');
+  const privatePem = `-----BEGIN OPENSSH PRIVATE KEY-----\n${wrapped}\n-----END OPENSSH PRIVATE KEY-----\n`;
+
+  return { public_key: publicLine, private_key_pem: privatePem };
+}
+
 // --- Meta file helpers ---
 function metaExists() { return fs.existsSync(META_FILE); }
 function readMeta() { return JSON.parse(fs.readFileSync(META_FILE, 'utf8')); }
@@ -348,6 +406,30 @@ app.get('/info', auth, (req, res) => {
     domain: VAULT_DOMAIN || req.hostname,
     hostname: req.hostname,
     token_ttl_seconds: TOKEN_TTL / 1000
+  });
+});
+
+// --- Keypair generator (stateless — vault never persists the output) ---
+// Generates an ed25519 SSH keypair server-side so the user doesn't need
+// ssh-keygen locally. Returns the private key PEM (OpenSSH format) plus a
+// base64-encoded version ready to paste into a secret's "value" field.
+app.post('/keygen', auth, (req, res) => {
+  const { type = 'ed25519', comment = '' } = req.body || {};
+  if (type !== 'ed25519') {
+    return res.status(400).json({ error: 'Only ed25519 is supported.' });
+  }
+  if (typeof comment !== 'string' || comment.length > 200) {
+    return res.status(400).json({ error: 'comment must be a string up to 200 chars' });
+  }
+  if (comment && /[\r\n\0]/.test(comment)) {
+    return res.status(400).json({ error: 'comment cannot contain newlines or NUL bytes' });
+  }
+  const pair = generateSshEd25519(comment);
+  res.json({
+    type: 'ed25519',
+    public_key: pair.public_key,                                   // ssh-ed25519 AAAA... [comment]
+    private_key_pem: pair.private_key_pem,                         // -----BEGIN OPENSSH PRIVATE KEY-----
+    private_key_base64: Buffer.from(pair.private_key_pem).toString('base64')
   });
 });
 

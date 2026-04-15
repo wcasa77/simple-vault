@@ -308,6 +308,18 @@ pre.mono, .secret-box {
 
 .secret-box.masked { color: transparent; text-shadow: 0 0 14px rgba(230,237,243,0.8); user-select: none; }
 
+/* --- Keypair generator panel (new-secret form) --- */
+.keypair-panel {
+  max-width: none;
+  background: rgba(46, 160, 67, 0.06);
+  border: 1px solid var(--accent);
+  margin: 0 0 1.25rem;
+  padding: 1.1rem 1.25rem;
+  box-shadow: none;
+}
+.keypair-panel h2 { font-size: 1rem; }
+.keypair-panel pre { margin: .5rem 0; }
+
 /* --- QR code panel --- */
 .qr-panel {
   display: flex;

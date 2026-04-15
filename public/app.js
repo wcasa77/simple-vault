@@ -27,6 +27,10 @@
 
     // settings / 2FA
     totpSetup: null,
+
+    // new-secret form (keypair generator stashes its output here so a re-render keeps it)
+    newKeypair: null,       // { public_key } — when set, panel shows above the form
+    newKeypairDraft: null,  // { name, value, notes } — form repopulation source
   };
 
   // -------------------- API client --------------------
@@ -250,16 +254,36 @@
       <p class="muted small">Loading&hellip;</p>
     </main>`,
 
-    new_secret: () => `${headerHtml()}<main class="detail">
+    new_secret: () => {
+      const d = state.newKeypairDraft || {};
+      const kp = state.newKeypair;
+      const kpPanel = kp ? `
+        <div class="panel keypair-panel">
+          <h2 style="margin:0 0 .4rem">New SSH keypair generated &mdash; copy the public key to the remote server</h2>
+          <p class="muted small" style="margin:0 0 .6rem">Paste this line into <code>~/.ssh/authorized_keys</code> on the target host (or use the one-liner below). Then fill in Host/User/Port in Notes and hit Save to store the private key in the vault.</p>
+          <pre class="mono" id="new-pub">${esc(kp.public_key)}</pre>
+          <div class="row fit space">
+            <button class="btn sm" type="button" data-action="copy_new_pub">Copy public key</button>
+            <button class="btn ghost sm" type="button" data-action="copy_new_authorized_keys_cmd">Copy authorized_keys one-liner</button>
+            <button class="btn ghost sm" type="button" data-action="dismiss_keypair_panel">Dismiss</button>
+          </div>
+          <p class="muted small" style="margin-top:.75rem">The private key is already in the Value field below (base64-encoded OpenSSH format). It only leaves the vault when you explicitly fetch it &mdash; it's NOT in this page's URL or browser history.</p>
+        </div>` : '';
+      return `${headerHtml()}<main class="detail">
       <div class="bar">
         <button class="btn ghost" data-action="back_to_dashboard">&larr; Back</button>
       </div>
       <h1>New secret</h1>
+      ${kpPanel}
       <form data-action="save_new">
-        <label>Name <span class="muted small">(a-z A-Z 0-9 . _ - &mdash; e.g. <code>prod.db-password</code> or <code>ssh.bastion-01.administrator</code>)</span></label>
-        <input type="text" name="name" required pattern="[a-zA-Z0-9._-]+" class="mono" autofocus>
+        <div class="field-head">
+          <label>Name <span class="muted small">(a-z A-Z 0-9 . _ - &mdash; e.g. <code>prod.db-password</code> or <code>ssh.bastion-01.administrator</code>)</span></label>
+          <button class="btn ghost sm" type="button" data-action="generate_keypair" title="Generate an ed25519 SSH keypair server-side. Value will be pre-filled.">${kp ? 'Regenerate keypair' : '+ Generate SSH keypair'}</button>
+        </div>
+        <input type="text" name="name" value="${esc(d.name || '')}" required pattern="[a-zA-Z0-9._-]+" class="mono"${kp ? '' : ' autofocus'}>
+
         <label>Value <span class="muted small">(for binary data like SSH keys / PFX files, base64-encode first &mdash; <code>base64 -w0</code> on Linux / <code>[Convert]::ToBase64String</code> on Windows)</span></label>
-        <textarea name="value" required class="mono" rows="3"></textarea>
+        <textarea name="value" required class="mono" rows="3">${esc(d.value || '')}</textarea>
 
         <div class="field-head" style="margin-top:.75rem">
           <label>Notes <span class="muted small">(make it self-documenting &mdash; the AI will read this to decide how to use the value)</span></label>
@@ -271,7 +295,7 @@
             <button class="btn ghost sm" type="button" data-action="insert_template" data-template="cert">Cert / PEM</button>
           </div>
         </div>
-        <textarea name="notes" class="mono" rows="8" placeholder="Host: 10.0.1.5&#10;User: administrator&#10;Port: 22&#10;Notes: base64-encoded; decode before writing to file."></textarea>
+        <textarea name="notes" class="mono" rows="10" placeholder="Host: 10.0.1.5&#10;User: administrator&#10;Port: 22&#10;Notes: base64-encoded; decode before writing to file.">${esc(d.notes || '')}</textarea>
 
         <div class="error" id="err"></div>
         <div class="row fit space">
@@ -279,7 +303,8 @@
           <button class="btn ghost" type="button" data-action="back_to_dashboard">Cancel</button>
         </div>
       </form>
-    </main>`,
+    </main>`;
+    },
 
     settings: () => `${headerHtml()}<main class="detail docs">
       <div class="bar">
@@ -777,7 +802,11 @@ Usage: base64-decode if stored as binary, then pass to openssl / curl --cert / e
     },
 
     // ---- Dashboard ----
-    new_secret() { go('new_secret'); },
+    new_secret() {
+      state.newKeypair = null;
+      state.newKeypairDraft = null;
+      go('new_secret');
+    },
 
     async open_secret(ev, el) {
       const name = el.dataset.name;
@@ -804,10 +833,73 @@ Usage: base64-decode if stored as binary, then pass to openssl / curl --cert / e
         await api('POST', '/secrets/' + encodeURIComponent(name), { value, notes });
         await loadDashboardData();
         state.currentSecretName = name;
+        state.newKeypair = null;
+        state.newKeypairDraft = null;
         go('secret');
         await loadSecretDetail(name);
         toast('Saved');
       } catch (e) { setErr(e.message); }
+    },
+
+    async generate_keypair() {
+      const form = document.querySelector('form[data-action="save_new"]');
+      if (!form) return;
+      // Preserve what the user has already typed into the form
+      state.newKeypairDraft = {
+        name: form.name.value,
+        value: form.value.value,
+        notes: form.notes.value,
+      };
+      const defaultComment = `vault-${new Date().toISOString().slice(0, 10)}@${(state.info && state.info.hostname) || 'laptop'}`;
+      const commentRaw = window.prompt(
+        'Comment for the public key (usually user@host — helps you recognise it in authorized_keys):',
+        defaultComment
+      );
+      if (commentRaw === null) return;  // user cancelled
+      const comment = commentRaw.trim() || defaultComment;
+      let r;
+      try {
+        r = await api('POST', '/keygen', { type: 'ed25519', comment });
+      } catch (e) { toast(e.message, true); return; }
+
+      state.newKeypair = { public_key: r.public_key };
+
+      // Auto-fill the name field if empty: ssh.<slug-of-comment>.id_ed25519
+      if (!state.newKeypairDraft.name) {
+        const slug = comment.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'key';
+        state.newKeypairDraft.name = `ssh.${slug}.id_ed25519`;
+      }
+      state.newKeypairDraft.value = r.private_key_base64;
+
+      // Prepend the public key + SSH template to notes, preserving any existing content
+      const publicSection =
+        `Public key (add to the remote server's ~/.ssh/authorized_keys):\n` +
+        `  ${r.public_key}\n`;
+      const tpl = NOTES_TEMPLATES['ssh-key'];
+      const existing = (state.newKeypairDraft.notes || '').trim();
+      state.newKeypairDraft.notes = publicSection + '\n' + tpl + (existing ? '\n\n---\n' + existing : '');
+      render();
+    },
+
+    async copy_new_pub() {
+      if (state.newKeypair) await copy(state.newKeypair.public_key);
+    },
+
+    async copy_new_authorized_keys_cmd() {
+      if (!state.newKeypair) return;
+      const pub = state.newKeypair.public_key;
+      // POSIX one-liner that idempotently adds the key
+      const cmd =
+        `mkdir -p ~/.ssh && chmod 700 ~/.ssh && ` +
+        `grep -qxF '${pub.replace(/'/g, "'\\''")}' ~/.ssh/authorized_keys 2>/dev/null || ` +
+        `echo '${pub.replace(/'/g, "'\\''")}' >> ~/.ssh/authorized_keys && ` +
+        `chmod 600 ~/.ssh/authorized_keys`;
+      await copy(cmd);
+    },
+
+    dismiss_keypair_panel() {
+      state.newKeypair = null;
+      render();
     },
 
     // ---- Secret detail ----
