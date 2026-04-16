@@ -67,6 +67,7 @@ const SHARE_TTL_MAX = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 const sessions = new Map(); // token -> { password, expires }
 const shares = new Map();   // shareToken -> { name, value, notes, expires, viewsLeft, createdAt }
+const wraps = new Map();    // wrapToken -> { value, expires }
 
 function deriveKey(password, salt) {
   return crypto.pbkdf2Sync(password, salt, KDF_ITERATIONS, KEY_LEN, KDF_DIGEST);
@@ -466,10 +467,41 @@ app.get('/secrets/:name', auth, (req, res) => {
   if (!fs.existsSync(secretPath(name))) return res.status(404).json({ error: 'Not found' });
   try {
     const { value, notes } = readSecret(name, req.vaultPassword);
+
+    // Response wrapping: return a one-time token instead of the raw value.
+    // The AI sees only the token; the actual secret is retrieved via
+    // GET /unwrap/<token> which returns raw text (designed for piping to file).
+    if (req.query.wrap === 'true') {
+      const WRAP_TTL = 60 * 1000; // 60 seconds
+      const wrapToken = crypto.randomBytes(24).toString('hex');
+      wraps.set(wrapToken, { value, expires: Date.now() + WRAP_TTL });
+      return res.json({
+        wrapped: true,
+        wrap_token: wrapToken,
+        expires_in: WRAP_TTL / 1000,
+        unwrap_url: `${baseUrl(req)}/unwrap/${wrapToken}`,
+        hint: 'curl -s <unwrap_url> > /tmp/secret  # one-time use, raw value, no JSON'
+      });
+    }
+
     res.json({ name, value, notes });
   } catch {
     res.status(500).json({ error: 'Decryption failed' });
   }
+});
+
+// Unwrap a wrapped secret — one-time use, returns raw text (no JSON).
+// Designed for: curl -s https://vault.example/unwrap/<token> > /tmp/key
+app.get('/unwrap/:token', (req, res) => {
+  const { token } = req.params;
+  const wrap = wraps.get(token);
+  if (!wrap || Date.now() > wrap.expires) {
+    wraps.delete(token);
+    return res.status(404).json({ error: 'Wrap token not found, expired, or already used' });
+  }
+  const value = wrap.value;
+  wraps.delete(token); // one-time use
+  res.type('text/plain').send(value);
 });
 
 app.delete('/secrets/:name', auth, (req, res) => {
@@ -586,6 +618,7 @@ setInterval(() => {
   const now = Date.now();
   for (const [t, s] of sessions) if (now > s.expires) sessions.delete(t);
   for (const [t, s] of shares) if (now > s.expires || s.viewsLeft <= 0) shares.delete(t);
+  for (const [t, w] of wraps) if (now > w.expires) wraps.delete(t);
 }, 5 * 60 * 1000);
 
 app.listen(PORT, '0.0.0.0', () => {
