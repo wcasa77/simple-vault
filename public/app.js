@@ -28,6 +28,10 @@
     // settings / 2FA
     totpSetup: null,
 
+    // agents
+    agents: [],
+    audit: [],
+
     // new-secret form (keypair generator stashes its output here so a re-render keeps it)
     newKeypair: null,       // { public_key } — when set, panel shows above the form
     newKeypairDraft: null,  // { name, value, notes } — form repopulation source
@@ -103,6 +107,25 @@
   function setErr(msg) {
     const err = document.getElementById('err');
     if (err) err.textContent = msg || '';
+  }
+
+  function timeAgo(iso) {
+    if (!iso) return 'never';
+    const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+    if (s < 60) return 'just now';
+    if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+    if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+    return `${Math.floor(s / 86400)}d ago`;
+  }
+
+  // Client-side mirror of the server's glob matcher (for live scope previews)
+  function globToRegex(pattern) {
+    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+    return new RegExp('^' + escaped + '$');
+  }
+
+  function patternsMatch(patterns, name) {
+    return patterns.some(p => { try { return globToRegex(p).test(name); } catch { return false; } });
   }
 
   // -------------------- Render + delegated events --------------------
@@ -237,7 +260,7 @@
       </div></div>`;
     },
 
-    dashboard: () => `${headerHtml()}<main>
+    dashboard: () => `${headerHtml('secrets')}<main>
       <div class="search">
         <input id="q" type="text" placeholder="Search secrets..." autocomplete="off">
         <button class="btn" data-action="new_secret">+ New secret</button>
@@ -246,7 +269,7 @@
       <p class="small muted center space">${state.secrets.length} secret${state.secrets.length===1?'':'s'} &middot; session auto-extends on activity (30-min idle timeout).</p>
     </main>`,
 
-    secret: () => `${headerHtml()}<main class="detail" id="detail-container">
+    secret: () => `${headerHtml('secrets')}<main class="detail" id="detail-container">
       <div class="bar">
         <button class="btn ghost" data-action="back_to_dashboard">&larr; Back</button>
       </div>
@@ -269,7 +292,7 @@
           </div>
           <p class="muted small" style="margin-top:.75rem">The private key is already in the Value field below (base64-encoded OpenSSH format). It only leaves the vault when you explicitly fetch it &mdash; it's NOT in this page's URL or browser history.</p>
         </div>` : '';
-      return `${headerHtml()}<main class="detail">
+      return `${headerHtml('secrets')}<main class="detail">
       <div class="bar">
         <button class="btn ghost" data-action="back_to_dashboard">&larr; Back</button>
       </div>
@@ -306,7 +329,28 @@
     </main>`;
     },
 
-    settings: () => `${headerHtml()}<main class="detail docs">
+    agents: () => {
+      const cards = state.agents.length ? state.agents.map(agentCardHtml).join('') : `
+        <div class="empty">
+          <p>No agents yet.</p>
+          <p class="muted small">An agent is a scoped identity for an AI assistant or automation: its own long-lived key, restricted to the secrets you pick. Paste an agent prompt into an AI chat instead of your all-access session token.</p>
+          <p><button class="btn" data-action="open_new_agent">Create your first agent</button></p>
+        </div>`;
+      return `${headerHtml('agents')}<main class="detail">
+        <div class="bar">
+          <h1 style="margin:0">Agents</h1>
+          <div style="flex:1"></div>
+          <button class="btn" data-action="open_new_agent">+ New agent</button>
+        </div>
+        <p class="muted small">Each agent gets its own <code>svk_</code> key (only a hash is stored — shown once at creation). Its policy decides which secrets it can list, read, or write. Everything an agent does is logged below.</p>
+        <div class="list">${cards}</div>
+        <hr>
+        <h2>Recent activity <button class="btn ghost sm" data-action="refresh_audit" style="margin-left:.5rem">Refresh</button></h2>
+        <div id="audit-area">${auditHtml()}</div>
+      </main>`;
+    },
+
+    settings: () => `${headerHtml('settings')}<main class="detail docs">
       <div class="bar">
         <button class="btn ghost" data-action="back_to_dashboard">&larr; Back</button>
       </div>
@@ -321,7 +365,7 @@
       <hr>
 
       <h2>API session token</h2>
-      <p class="muted small">Your current session token &mdash; use it for direct <code>curl</code> / PowerShell API access. Expires after 30 minutes of inactivity.</p>
+      <p class="muted small">Your current session token &mdash; full access, expires after 30 minutes of inactivity. For AI assistants and automation, prefer a scoped <a href="#" data-action="open_agents">agent key</a> instead.</p>
       <div class="field">
         <div class="field-head">
           <label>Token</label>
@@ -334,6 +378,26 @@
 
       <h2>API quick reference</h2>
       <details open>
+        <summary><strong>Agent keys (recommended for AI/automation)</strong></summary>
+<pre># An agent key is long-lived and scoped — create one in the Agents tab.
+KEY='&lt;svk_AGENT_KEY&gt;'
+URL='${esc((state.info && state.info.url) || '')}'
+
+# List (only the secrets this agent may see)
+curl "$URL/secrets" -H "x-vault-key: $KEY"
+
+# Read
+curl "$URL/secrets/&lt;name&gt;" -H "x-vault-key: $KEY"
+
+# Read wrapped (one-time unwrap URL — value never in the JSON response)
+curl "$URL/secrets/&lt;name&gt;?wrap=true" -H "x-vault-key: $KEY"
+
+# Write (needs write perm in the agent's policy)
+curl -X POST "$URL/secrets/&lt;name&gt;" \\
+  -H "x-vault-key: $KEY" -H 'Content-Type: application/json' \\
+  -d '{"value":"...","notes":"..."}'</pre>
+      </details>
+      <details>
         <summary><strong>Get a session token (then reuse it for all other calls)</strong></summary>
 <pre>curl -X POST ${esc((state.info && state.info.url) || '')}/unlock \\
   -H 'Content-Type: application/json' \\
@@ -341,7 +405,7 @@
 # =&gt; {"token":"&lt;SESSION_TOKEN&gt;","expires_in":1800}</pre>
       </details>
       <details>
-        <summary><strong>List / read / write / delete secrets</strong></summary>
+        <summary><strong>List / read / write / delete secrets (session)</strong></summary>
 <pre>TOKEN='&lt;SESSION_TOKEN&gt;'
 URL='${esc((state.info && state.info.url) || '')}'
 
@@ -393,15 +457,19 @@ $h = @{"x-vault-token"=$token}
     </main>`,
   };
 
-  function headerHtml() {
+  function headerHtml(active) {
+    const tab = (id, label, action) =>
+      `<button class="btn ghost sm${active === id ? ' active-tab' : ''}" data-action="${action}">${label}</button>`;
     return `<header class="app-header">
-      <div class="brand">
+      <div class="brand" data-action="back_to_dashboard" style="cursor:pointer">
         <svg viewBox="0 0 24 24"><path d="M12 2 4 6v6c0 5 3.4 9.3 8 10 4.6-.7 8-5 8-10V6l-8-4z"/></svg>
         <span>${esc((state.health && state.health.name) || 'Simple Vault')}</span>
       </div>
       <div style="flex:1"></div>
       <nav>
-        <button class="btn ghost sm" data-action="open_settings">Settings</button>
+        ${tab('secrets', 'Secrets', 'back_to_dashboard')}
+        ${tab('agents', 'Agents', 'open_agents')}
+        ${tab('settings', 'Settings', 'open_settings')}
         <button class="btn ghost sm" data-action="lock">Lock</button>
       </nav>
     </header>`;
@@ -425,69 +493,160 @@ $h = @{"x-vault-token"=$token}
     `).join('');
   }
 
-  function secretDetailHtml(sec) {
-    const notesEmpty = !sec.notes || !sec.notes.trim();
-    return `<div class="bar">
-        <button class="btn ghost" data-action="back_to_dashboard">&larr; Back</button>
-        <div style="flex:1"></div>
-        <button class="btn" data-action="copy_ai_prompt" data-mode="safe" title="Copies token + fetch instructions — the value is NOT in the prompt. Recommended for SSH keys and anything sensitive.">Copy AI prompt (safe)</button>
-        <button class="btn ghost" data-action="copy_ai_prompt" data-mode="inline" title="Copies the prompt WITH the raw value inline. Faster but the value hits the AI provider's logs.">with value</button>
-        <button class="btn ghost" data-action="open_share">Share link</button>
-        <button class="btn danger" data-action="delete_secret">Delete</button>
-      </div>
-      <h1>${esc(sec.name)}</h1>
-      <form data-action="save_secret">
-        <div class="field">
-          <div class="field-head">
-            <label>Value</label>
-            <div class="row fit">
-              <button class="btn ghost sm" type="button" data-action="toggle_reveal">Show / hide</button>
-              <button class="btn ghost sm" type="button" data-action="copy_value">Copy</button>
-            </div>
-          </div>
-          <textarea name="value" class="secret-box masked mono" id="secret-value" rows="3">${esc(sec.value)}</textarea>
-        </div>
-        <div class="field">
-          <div class="field-head">
-            <label>Notes <span class="muted small">(how the AI should use this secret — host, user, decode tips)</span></label>
-            <div class="row fit">
-              <button class="btn ghost sm" type="button" data-action="insert_template" data-template="ssh-key">SSH key</button>
-              <button class="btn ghost sm" type="button" data-action="insert_template" data-template="ssh-password">SSH pw</button>
-              <button class="btn ghost sm" type="button" data-action="insert_template" data-template="database">DB</button>
-              <button class="btn ghost sm" type="button" data-action="insert_template" data-template="api-token">API token</button>
-              <button class="btn ghost sm" type="button" data-action="copy_notes">Copy</button>
-            </div>
-          </div>
-          ${notesEmpty ? `<div class="warn small" style="margin:.25rem 0 .5rem">Notes are empty &mdash; the AI will have to guess which host / user / decoding applies. Click a template above or fill in manually, then save.</div>` : ''}
-          <textarea name="notes" class="mono" id="secret-notes" rows="6" placeholder="Host: 10.0.1.5&#10;User: administrator&#10;Port: 22&#10;Notes: base64-encoded; decode before writing to file.">${esc(sec.notes || '')}</textarea>
-        </div>
-        <div class="error" id="err"></div>
-        <div class="row fit space">
-          <button class="btn">Save changes</button>
-        </div>
-      </form>
-      <hr>
-      <h2>AI prompt preview (safe mode)</h2>
-      <p class="muted small">
-        <strong>Safe mode</strong> (default): the prompt includes the session token + fetch instructions but <em>not</em> the value. The AI runs <code>curl</code> inside a subprocess so the value stays out of chat logs &mdash; ideal for SSH keys and other sensitive data.<br>
-        <strong>With value</strong>: convenience only. Paste at your own risk for non-sensitive secrets.
-      </p>
-      <pre class="mono" id="ai-preview">${esc(buildAiPrompt(sec, 'safe'))}</pre>`;
+  // -------------------- Agents --------------------
+
+  function policySummary(a) {
+    return (a.policy || []).map(r => `<code>${esc(r.pattern)}</code>&thinsp;<span class="muted">(${r.perms.join(',')})</span>`).join(' &middot; ');
   }
 
-  // mode: 'safe' (default, token-only — AI fetches value itself inside a subprocess)
-  //       'inline' (includes the raw value — convenient but the value hits the AI provider's logs)
-  function buildAiPrompt(sec, mode = 'safe') {
+  function agentCardHtml(a) {
+    const stale = a.last_used && (Date.now() - new Date(a.last_used).getTime() > 30 * 86400000);
+    const neverUsed = !a.last_used && (Date.now() - new Date(a.created).getTime() > 30 * 86400000);
+    const expired = a.expires_at && Date.now() > new Date(a.expires_at).getTime();
+    return `<div class="item agent-card" style="flex-wrap:wrap;align-items:flex-start">
+      <div style="flex:1;min-width:240px">
+        <div class="name">${esc(a.name)}
+          ${a.disabled ? '<span class="tag">Disabled</span>' : expired ? '<span class="tag bad">Expired</span>' : '<span class="tag good">Active</span>'}
+        </div>
+        <div class="small muted" style="margin:.25rem 0">${policySummary(a)}</div>
+        <div class="small muted">
+          ${a.matched_secrets.length} secret${a.matched_secrets.length === 1 ? '' : 's'} in scope
+          &middot; last used: ${esc(timeAgo(a.last_used))}
+          ${a.expires_at ? ` &middot; expires ${esc(new Date(a.expires_at).toISOString().slice(0, 10))}` : ''}
+          ${(stale || neverUsed) ? ' &middot; <span class="warn-text">⚠ unused for 30+ days — consider revoking</span>' : ''}
+        </div>
+      </div>
+      <div class="row fit" style="gap:.35rem">
+        <button class="btn sm" data-action="agent_prompt" data-id="${esc(a.id)}" title="Mints a fresh key for this agent (old key stops working) and copies a ready-to-paste AI prompt scoped to this agent.">Copy AI prompt</button>
+        <button class="btn ghost sm" data-action="edit_agent" data-id="${esc(a.id)}">Edit</button>
+        <button class="btn ghost sm" data-action="rotate_agent" data-id="${esc(a.id)}">Rotate key</button>
+        <button class="btn ghost sm" data-action="toggle_agent" data-id="${esc(a.id)}">${a.disabled ? 'Enable' : 'Disable'}</button>
+        <button class="btn danger sm" data-action="revoke_agent" data-id="${esc(a.id)}">Revoke</button>
+      </div>
+    </div>`;
+  }
+
+  function auditHtml() {
+    if (!state.audit.length) return `<p class="muted small">No activity yet.</p>`;
+    const rows = state.audit.slice(0, 50).map(e => `
+      <div class="audit-row small mono">
+        <span class="muted">${esc((e.ts || '').replace('T', ' ').slice(0, 19))}</span>
+        <span class="${e.actor === 'master' ? '' : 'accent'}">${esc(e.actor)}</span>
+        <span class="${e.ok ? '' : 'warn-text'}">${esc(e.action)}${e.ok ? '' : ' ✗ DENIED'}</span>
+        <span>${esc(e.target || '')}</span>
+        <span class="muted">${esc(e.ip || '')}</span>
+      </div>`).join('');
+    return `<div class="audit-list">${rows}</div>`;
+  }
+
+  function newAgentModalHtml(existing) {
+    const a = existing || null;
+    const patterns = a ? a.policy.map(r => r.pattern).join('\n') : '';
+    const writable = a ? a.policy.some(r => r.perms.includes('write')) : false;
+    const secretChecks = state.secrets.map(n => `
+      <label class="check-row"><input type="checkbox" data-action="scope_pick" data-event="change" value="${esc(n)}"> <code>${esc(n)}</code></label>`).join('');
+    return `
+      <h2>${a ? `Edit agent “${esc(a.name)}”` : 'New agent'}</h2>
+      <form data-action="${a ? 'update_agent' : 'create_agent'}" ${a ? `data-id="${esc(a.id)}"` : ''}>
+        ${a ? '' : `<label>Name <span class="muted small">(who is this key for — e.g. <code>hermes</code>, <code>seo-agent</code>, <code>local-claude</code>)</span></label>
+        <input type="text" name="name" required pattern="[a-zA-Z0-9._-]+" maxlength="60" class="mono" autofocus>`}
+
+        <label class="space">Scope patterns <span class="muted small">(one per line; <code>*</code> is a wildcard — e.g. <code>strapi.*</code>)</span></label>
+        <textarea name="patterns" class="mono" rows="3" required placeholder="strapi.*&#10;deepseek-api">${esc(patterns)}</textarea>
+        <div class="small muted" id="scope-preview" style="margin:.25rem 0 .5rem"></div>
+
+        <details ${state.secrets.length ? '' : 'hidden'}>
+          <summary class="small">Pick from existing secrets instead</summary>
+          <div class="scope-picker">${secretChecks}</div>
+        </details>
+
+        <label class="space">Permissions</label>
+        <label class="check-row"><input type="radio" name="perms" value="read" ${writable ? '' : 'checked'}> Read-only <span class="muted small">(recommended)</span></label>
+        <label class="check-row"><input type="radio" name="perms" value="readwrite" ${writable ? 'checked' : ''}> Read + write</label>
+
+        <label class="space">Key expiry <span class="muted small">(optional)</span></label>
+        <select name="expires">
+          <option value="">Never</option>
+          <option value="7">7 days</option>
+          <option value="30" ${a && a.expires_at ? 'selected' : ''}>30 days</option>
+          <option value="90">90 days</option>
+          <option value="365">1 year</option>
+        </select>
+
+        <label class="space">Prompt notes <span class="muted small">(optional — extra instructions appended to this agent's AI prompt, e.g. project paths, rules)</span></label>
+        <textarea name="prompt_notes" class="mono" rows="4" placeholder="Project dir: /root/my-project/&#10;Never run destructive commands without asking.">${esc(a ? a.prompt_notes : '')}</textarea>
+
+        <div class="error" id="err"></div>
+        <div class="row fit space">
+          <button class="btn">${a ? 'Save changes' : 'Create agent'}</button>
+          <button class="btn ghost" type="button" data-action="close_modal">Cancel</button>
+        </div>
+      </form>`;
+  }
+
+  function attachScopePreview() {
+    const modal = document.getElementById('modal-body');
+    if (!modal) return;
+    const ta = modal.querySelector('textarea[name=patterns]');
+    const preview = modal.querySelector('#scope-preview');
+    if (!ta || !preview) return;
+    const update = () => {
+      const pats = ta.value.split('\n').map(s => s.trim()).filter(Boolean);
+      if (!pats.length) { preview.textContent = ''; return; }
+      const matched = state.secrets.filter(n => patternsMatch(pats, n));
+      preview.innerHTML = matched.length
+        ? `Matches <strong>${matched.length}</strong> of ${state.secrets.length} secrets: ${matched.slice(0, 8).map(n => `<code>${esc(n)}</code>`).join(' ')}${matched.length > 8 ? ` &hellip;+${matched.length - 8}` : ''}`
+        : `<span class="warn-text">Matches no existing secrets (patterns still apply to future secrets).</span>`;
+    };
+    ta.addEventListener('input', update);
+    update();
+  }
+
+  function agentKeyModalHtml(agent, key, isRotation) {
+    return `
+      <h2>${isRotation ? 'Key rotated' : 'Agent created'}: ${esc(agent.name)}</h2>
+      <p class="warn small"><strong>This key is shown only once.</strong> The vault stores just a hash of it. If you lose it, rotate to mint a new one.${isRotation ? ' The old key has stopped working.' : ''}</p>
+      <div class="field">
+        <div class="field-head">
+          <label>Agent key</label>
+          <button class="btn ghost sm" data-action="copy_text" data-copy="${esc(key)}">Copy key</button>
+        </div>
+        <pre class="mono" style="word-break:break-all">${esc(key)}</pre>
+      </div>
+      <p class="muted small">Scope: ${policySummary(agent)} &middot; ${agent.matched_secrets.length} secret(s) currently in scope.</p>
+      <div class="row fit space">
+        <button class="btn" data-action="copy_agent_prompt_with_key" data-id="${esc(agent.id)}" data-key="${esc(key)}">Copy AI prompt (safe)</button>
+        <button class="btn ghost" data-action="close_modal">Done</button>
+      </div>
+      <p class="muted small space">The AI prompt contains this key + fetch instructions, scoped to only this agent's secrets — paste it into Claude Code / Cursor / etc.</p>`;
+  }
+
+  // -------------------- AI prompt builder --------------------
+  // cred: { kind: 'session' } → x-vault-token, full access (legacy behaviour)
+  //       { kind: 'agent', key, agent } → x-vault-key, scoped
+  function buildAiPrompt(sec, mode = 'safe', cred = { kind: 'session' }) {
     const info = state.info || {};
     const url = info.url || '';
-    const token = state.token || '';
-    const list = state.secrets || [];
+    const isAgent = cred.kind === 'agent';
+    const header = isAgent ? 'x-vault-key' : 'x-vault-token';
+    const token = isAgent ? cred.key : (state.token || '');
     const descLine = info.description ? `Environment: ${info.description}\n` : '';
     const notes = sec.notes && sec.notes.trim()
       ? sec.notes.split('\n').map(l => '  ' + l).join('\n')
       : '  (empty — I forgot to fill these in. Guess from the name or ask me.)';
-    const others = list.filter(n => n !== sec.name).slice(0, 50).map(n => `  - ${n}`).join('\n') || '  (none)';
     const name = sec.name || '';
+
+    // Scoped inventory: an agent prompt reveals ONLY that agent's secrets.
+    const scopeList = isAgent ? (cred.agent.matched_secrets || []) : (state.secrets || []);
+    const others = scopeList.filter(n => n !== name).map(n => `  - ${n}`).join('\n') || '  (none)';
+
+    const agentNotes = isAgent && cred.agent.prompt_notes && cred.agent.prompt_notes.trim()
+      ? `\n=== Standing instructions for this agent ===\n${cred.agent.prompt_notes.trim()}\n`
+      : '';
+
+    const credLine = isAgent
+      ? `Agent key for "${cred.agent.name}" (long-lived, scoped to the secrets listed below):\n  ${token}`
+      : `Session token (30-min TTL, auto-extends on activity):\n  ${token}`;
 
     if (mode === 'inline') {
       return `!! HEADS UP: this prompt includes the RAW SECRET VALUE below.
@@ -499,34 +658,32 @@ I'm using Simple Vault (a self-hosted secrets manager) and sharing a credential 
 
 === Vault Connection ===
 URL:         ${url}
-Auth header: x-vault-token
-${descLine}Session token (30-min TTL, auto-extends on activity):
-  ${token}
+Auth header: ${header}
+${descLine}${credLine}
 
 === Secret ===
 Name:  ${name}
 Value: ${sec.value}
 Notes:
 ${notes}
-
-=== Other secrets available with this token ===
+${agentNotes}
+=== Other secrets available with this credential ===
 ${others}
 
 Quick reference:
-  List:  curl ${url}/secrets -H "x-vault-token: ${token}"
-  Read:  curl ${url}/secrets/<name> -H "x-vault-token: ${token}"
+  List:  curl ${url}/secrets -H "${header}: ${token}"
+  Read:  curl ${url}/secrets/<name> -H "${header}: ${token}"
 
 Please don't echo the value or the token back in your replies.`;
     }
 
     // --- 'safe' mode ---
-    return `I'm using Simple Vault (a self-hosted secrets manager) with a shell-capable AI (Claude Code / Cursor / Aider / etc.). I am giving you a short-lived session TOKEN so you can fetch the secret yourself — the VALUE is intentionally NOT in this chat, so it doesn't land in the AI provider's logs.
+    return `I'm using Simple Vault (a self-hosted secrets manager) with a shell-capable AI (Claude Code / Cursor / Aider / etc.). I am giving you a ${isAgent ? 'scoped agent KEY' : 'short-lived session TOKEN'} so you can fetch the secret yourself — the VALUE is intentionally NOT in this chat, so it doesn't land in the AI provider's logs.
 
 === Vault Connection ===
 URL:         ${url}
-Auth header: x-vault-token
-${descLine}Session token (30-min TTL, auto-extends on activity):
-  ${token}
+Auth header: ${header}
+${descLine}${credLine}
 
 === What I want you to do ===
 Use the secret named:
@@ -534,11 +691,11 @@ Use the secret named:
 
 Notes about this secret (authoritative — read before running commands):
 ${notes}
-
+${agentNotes}
 === Security rules — please follow strictly ===
 - DO NOT print, echo, cat, or log the secret value anywhere in your replies.
-- Fetch it INSIDE a command pipeline so the value stays in subprocess
-  stdin/stdout and never ends up in the chat text (recipes below).
+- Prefer the WRAP flow below: the API hands you a one-time URL whose output you
+  pipe straight to a file or variable — the value never appears in any JSON you read.
 - If you need it more than once, save to a temp file with chmod 600
   (or a shell variable) — don't re-fetch and don't paste it around.
 - When done, shred/remove any temp files you created.
@@ -551,43 +708,36 @@ ${notes}
 
 === Recipes (fill in <USER>/<HOST>/etc. from Notes above) ===
 
-# Bash — plain secret (password / API token) into a variable, no echo
-TOKEN='${token}'
+# Bash — RECOMMENDED wrap flow: value goes API → one-time URL → file, never through JSON you print
+KEY='${token}'
 URL='${url}'
 NAME='${name}'
-VAL=$(curl -s "$URL/secrets/$NAME" -H "x-vault-token: $TOKEN" | jq -r .value)
+UNWRAP=$(curl -s "$URL/secrets/$NAME?wrap=true" -H "${header}: $KEY" | jq -r .unwrap_url)
+VAL=$(curl -s "$UNWRAP")   # one-time use — fetch exactly once
 # ...use "$VAL" directly; do not 'echo $VAL'
 
-# Bash — SSH private key stored base64-encoded: decode, connect, delete
-TOKEN='${token}'; URL='${url}'; NAME='${name}'
-curl -s "$URL/secrets/$NAME" -H "x-vault-token: $TOKEN" \\
-  | jq -r .value | base64 -d > /tmp/svkey && chmod 600 /tmp/svkey
+# Bash — SSH private key stored base64-encoded: decode to file, connect, delete
+KEY='${token}'; URL='${url}'; NAME='${name}'
+curl -s "$(curl -s "$URL/secrets/$NAME?wrap=true" -H "${header}: $KEY" | jq -r .unwrap_url)" \\
+  | base64 -d > /tmp/svkey && chmod 600 /tmp/svkey
 ssh -i /tmp/svkey -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new <USER>@<HOST>
 shred -u /tmp/svkey 2>/dev/null || rm -f /tmp/svkey
 
 # PowerShell — plain secret into a variable
-$h = @{"x-vault-token"='${token}'}
-$val = (Invoke-RestMethod -Uri '${url}/secrets/${name}' -Headers $h).value
+$h = @{"${header}"='${token}'}
+$w = Invoke-RestMethod -Uri '${url}/secrets/${name}?wrap=true' -Headers $h
+$val = (Invoke-WebRequest -Uri $w.unwrap_url).Content
 # ...use $val; do not 'Write-Output $val' it back
 
-# PowerShell — SSH private key stored base64-encoded
-$h = @{"x-vault-token"='${token}'}
-$v = (Invoke-RestMethod -Uri '${url}/secrets/${name}' -Headers $h).value
-$key = Join-Path $env:TEMP 'svkey'
-[IO.File]::WriteAllBytes($key, [Convert]::FromBase64String($v))
-icacls $key /inheritance:r /grant:r "$($env:USERNAME):R" | Out-Null
-ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new <USER>@<HOST>
-Remove-Item $key -Force
-
-=== Other secrets available with this token ===
+=== Secrets available with this credential ===
 ${others}
 
 === Quick reference ===
-  List:  curl ${url}/secrets -H "x-vault-token: ${token}"
-  Read:  curl ${url}/secrets/<name> -H "x-vault-token: ${token}"
-  Lock:  curl -X POST ${url}/lock -H "x-vault-token: ${token}"
-
-Treat the session token above as sensitive — please don't echo it back.`;
+  List:  curl ${url}/secrets -H "${header}: ${token}"
+  Read:  curl ${url}/secrets/<name> -H "${header}: ${token}"
+  Wrap:  curl "${url}/secrets/<name>?wrap=true" -H "${header}: ${token}"   # then curl the unwrap_url once
+${isAgent ? '' : `  Lock:  curl -X POST ${url}/lock -H "${header}: ${token}"\n`}
+Treat the ${isAgent ? 'agent key' : 'session token'} above as sensitive — please don't echo it back.`;
   }
 
   // Templates the user can one-click into the Notes field. Deliberately opinionated:
@@ -692,6 +842,41 @@ Usage: base64-decode if stored as binary, then pass to openssl / curl --cert / e
       </div>`);
   }
 
+  // Picker shown from a secret's "Copy AI prompt" — choose which identity the prompt uses.
+  function renderPromptPickerModal(mode) {
+    const name = state.currentSecretName;
+    const covering = state.agents.filter(a => !a.disabled && (a.matched_secrets || []).includes(name));
+    const agentRows = covering.map(a => `
+      <div class="item" data-action="prompt_as_agent" data-id="${esc(a.id)}" data-mode="${esc(mode)}">
+        <div>
+          <div class="name">${esc(a.name)} <span class="tag good">scoped</span></div>
+          <div class="small muted">${a.matched_secrets.length} secret(s) visible &middot; mints a fresh key (old key stops working)</div>
+        </div>
+        <div class="arrow">&rsaquo;</div>
+      </div>`).join('');
+    openModal(`
+      <h2>Copy AI prompt for &ldquo;${esc(name)}&rdquo;</h2>
+      <p class="muted small">Pick which identity goes into the prompt. A <strong>scoped agent</strong> is safer: the AI can only ever see that agent's secrets, and the key is revocable without touching anything else.</p>
+      ${agentRows || `<p class="muted small">No agent currently covers this secret. Create one below — it takes 10 seconds.</p>`}
+      <div class="item" data-action="prompt_new_agent" data-mode="${esc(mode)}">
+        <div>
+          <div class="name">+ New scoped agent for this secret</div>
+          <div class="small muted">Read-only key limited to <code>${esc(name)}</code></div>
+        </div>
+        <div class="arrow">&rsaquo;</div>
+      </div>
+      <div class="item" data-action="prompt_as_session" data-mode="${esc(mode)}">
+        <div>
+          <div class="name">Session token <span class="tag">full access</span></div>
+          <div class="small muted">30-min TTL, but can read EVERY secret and its prompt lists your whole inventory.</div>
+        </div>
+        <div class="arrow">&rsaquo;</div>
+      </div>
+      <div class="row fit space">
+        <button class="btn ghost" data-action="close_modal">Cancel</button>
+      </div>`);
+  }
+
   // -------------------- 2FA settings panel --------------------
 
   function renderTwofaArea() {
@@ -779,6 +964,7 @@ Usage: base64-decode if stored as binary, then pass to openssl / curl --cert / e
       try {
         const r = await api('POST', '/unlock', body);
         setToken(r.token);
+        if (r.migrated > 0) toast(`Vault upgraded: ${r.migrated} secret(s) migrated to envelope encryption`);
         await loadDashboardData();
         go('dashboard');
       } catch (e) {
@@ -821,6 +1007,232 @@ Usage: base64-decode if stored as binary, then pass to openssl / curl --cert / e
     async open_settings() {
       go('settings');
       await loadSettings();
+    },
+
+    // ---- Agents ----
+    async open_agents() {
+      go('agents');
+      await loadAgents();
+      render();
+    },
+
+    open_new_agent() {
+      openModal(newAgentModalHtml(null));
+      attachScopePreview();
+    },
+
+    edit_agent(ev, el) {
+      const a = state.agents.find(x => x.id === el.dataset.id);
+      if (!a) return;
+      openModal(newAgentModalHtml(a));
+      attachScopePreview();
+    },
+
+    scope_pick(ev, el) {
+      // Checkbox helper: append/remove the exact secret name in the patterns textarea
+      const modal = document.getElementById('modal-body');
+      const ta = modal && modal.querySelector('textarea[name=patterns]');
+      if (!ta) return;
+      let pats = ta.value.split('\n').map(s => s.trim()).filter(Boolean);
+      if (el.checked) { if (!pats.includes(el.value)) pats.push(el.value); }
+      else pats = pats.filter(p => p !== el.value);
+      ta.value = pats.join('\n');
+      ta.dispatchEvent(new Event('input'));
+    },
+
+    async create_agent(ev, form) {
+      setErr('');
+      const patterns = form.patterns.value.split('\n').map(s => s.trim()).filter(Boolean);
+      if (!patterns.length) { setErr('At least one scope pattern is required.'); return; }
+      const perms = form.perms.value === 'readwrite' ? ['read', 'write'] : ['read'];
+      const body = {
+        name: form.name.value.trim(),
+        policy: patterns.map(p => ({ pattern: p, perms })),
+        prompt_notes: form.prompt_notes.value,
+      };
+      const days = parseInt(form.expires.value, 10);
+      if (days > 0) body.expires_days = days;
+      try {
+        const r = await api('POST', '/agents', body);
+        await loadAgents();
+        render();
+        openModal(agentKeyModalHtml(r, r.key, false));
+      } catch (e) { setErr(e.message); }
+    },
+
+    async update_agent(ev, form) {
+      setErr('');
+      const id = form.dataset.id;
+      const patterns = form.patterns.value.split('\n').map(s => s.trim()).filter(Boolean);
+      if (!patterns.length) { setErr('At least one scope pattern is required.'); return; }
+      const perms = form.perms.value === 'readwrite' ? ['read', 'write'] : ['read'];
+      const body = {
+        policy: patterns.map(p => ({ pattern: p, perms })),
+        prompt_notes: form.prompt_notes.value,
+      };
+      const days = parseInt(form.expires.value, 10);
+      body.expires_days = days > 0 ? days : null;
+      try {
+        await api('PATCH', '/agents/' + encodeURIComponent(id), body);
+        closeModal();
+        await loadAgents();
+        render();
+        toast('Agent updated');
+      } catch (e) { setErr(e.message); }
+    },
+
+    async rotate_agent(ev, el) {
+      const a = state.agents.find(x => x.id === el.dataset.id);
+      if (!a) return;
+      if (!confirm(`Rotate the key for "${a.name}"?\n\nThe current key stops working immediately — anything still using it will get 401s until you give it the new key.`)) return;
+      const r = await api('POST', '/agents/' + encodeURIComponent(a.id) + '/rotate');
+      await loadAgents();
+      render();
+      openModal(agentKeyModalHtml(r, r.key, true));
+    },
+
+    async toggle_agent(ev, el) {
+      const a = state.agents.find(x => x.id === el.dataset.id);
+      if (!a) return;
+      await api('PATCH', '/agents/' + encodeURIComponent(a.id), { disabled: !a.disabled });
+      await loadAgents();
+      render();
+      toast(a.disabled ? 'Agent enabled' : 'Agent disabled');
+    },
+
+    async revoke_agent(ev, el) {
+      const a = state.agents.find(x => x.id === el.dataset.id);
+      if (!a) return;
+      if (!confirm(`Revoke agent "${a.name}"?\n\nIts key stops working immediately. This cannot be undone (create a new agent instead).`)) return;
+      await api('DELETE', '/agents/' + encodeURIComponent(a.id));
+      await loadAgents();
+      render();
+      toast('Agent revoked');
+    },
+
+    async refresh_audit() {
+      await loadAudit();
+      const area = document.getElementById('audit-area');
+      if (area) { area.innerHTML = auditHtml(); attachHandlers(area); }
+    },
+
+    // "Copy AI prompt" from an agent card: rotate to obtain a fresh key, then build the prompt.
+    async agent_prompt(ev, el) {
+      const a = state.agents.find(x => x.id === el.dataset.id);
+      if (!a) return;
+      if (!confirm(`Copy an AI prompt for "${a.name}"?\n\nThis mints a FRESH key for the agent (the old key stops working) and copies a ready-to-paste prompt scoped to its ${a.matched_secrets.length} secret(s).`)) return;
+      const r = await api('POST', '/agents/' + encodeURIComponent(a.id) + '/rotate');
+      await loadAgents();
+      render();
+      const first = r.matched_secrets[0];
+      let sec = { name: first || '', value: '', notes: '' };
+      if (first) {
+        try { const s = await api('GET', '/secrets/' + encodeURIComponent(first)); sec = s; } catch { /* prompt still useful */ }
+      }
+      await copy(buildAiPrompt(sec, 'safe', { kind: 'agent', key: r.key, agent: r }));
+      toast('Scoped AI prompt copied (key rotated)');
+    },
+
+    async copy_agent_prompt_with_key(ev, el) {
+      const a = state.agents.find(x => x.id === el.dataset.id);
+      if (!a) return;
+      const first = (a.matched_secrets || [])[0];
+      let sec = { name: first || '', value: '', notes: '' };
+      if (first) {
+        try { sec = await api('GET', '/secrets/' + encodeURIComponent(first)); } catch { /* ignore */ }
+      }
+      await copy(buildAiPrompt(sec, 'safe', { kind: 'agent', key: el.dataset.key, agent: a }));
+    },
+
+    copy_text(ev, el) { copy(el.dataset.copy); },
+
+    // ---- Secret detail ----
+    toggle_reveal() {
+      const box = document.getElementById('secret-value');
+      if (box) box.classList.toggle('masked');
+    },
+
+    async copy_value() {
+      const box = document.getElementById('secret-value');
+      if (box) await copy(box.value || box.textContent);
+    },
+
+    async copy_notes() {
+      const box = document.getElementById('secret-notes');
+      if (box) await copy(box.value || box.textContent);
+    },
+
+    async copy_ai_prompt(ev, el) {
+      if (!state.currentSecret) return;
+      const mode = (el && el.dataset && el.dataset.mode) === 'inline' ? 'inline' : 'safe';
+      if (mode === 'inline') {
+        const ok = confirm(
+          'You\'re about to copy the raw secret value into your clipboard along with the AI prompt.\n\n' +
+          'If you paste this into an AI chat, the value is transmitted to the AI provider\n' +
+          'and stored in the chat history.\n\n' +
+          'For SSH keys / high-sensitivity secrets, use "Copy AI prompt (safe)" instead,\n' +
+          'which lets the AI fetch the value via curl in a subprocess without exposing it.\n\n' +
+          'Proceed with inline value?'
+        );
+        if (!ok) return;
+      }
+      if (!state.agents.length) { try { await loadAgents(); } catch { /* session might lack agents — fine */ } }
+      renderPromptPickerModal(mode);
+    },
+
+    async prompt_as_agent(ev, el) {
+      const a = state.agents.find(x => x.id === el.dataset.id);
+      const mode = el.dataset.mode || 'safe';
+      if (!a) return;
+      if (!confirm(`Use agent "${a.name}"?\n\nThis mints a FRESH key (its old key stops working) so the prompt contains a working credential.`)) return;
+      const r = await api('POST', '/agents/' + encodeURIComponent(a.id) + '/rotate');
+      closeModal();
+      await loadAgents();
+      const sec = currentSecWithEdits();
+      await copy(buildAiPrompt(sec, mode, { kind: 'agent', key: r.key, agent: r }));
+      toast(`Scoped prompt copied (agent: ${a.name})`);
+    },
+
+    async prompt_new_agent(ev, el) {
+      const mode = el.dataset.mode || 'safe';
+      const name = state.currentSecretName;
+      const suggested = name.replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 40) + '-agent';
+      const agentName = window.prompt('Name for the new agent (read-only, scoped to this secret):', suggested);
+      if (!agentName) return;
+      try {
+        const r = await api('POST', '/agents', {
+          name: agentName.trim(),
+          policy: [{ pattern: name, perms: ['read'] }],
+        });
+        closeModal();
+        await loadAgents();
+        if (state.view === 'agents') render();
+        const sec = currentSecWithEdits();
+        await copy(buildAiPrompt(sec, mode, { kind: 'agent', key: r.key, agent: r }));
+        toast(`Agent "${r.name}" created — scoped prompt copied`);
+      } catch (e) { toast(e.message, true); }
+    },
+
+    async prompt_as_session(ev, el) {
+      const mode = el.dataset.mode || 'safe';
+      closeModal();
+      const sec = currentSecWithEdits();
+      await copy(buildAiPrompt(sec, mode, { kind: 'session' }));
+      toast('Prompt copied (full-access session token)');
+    },
+
+    insert_template(ev, el) {
+      const which = el.dataset.template;
+      const tpl = NOTES_TEMPLATES[which];
+      if (!tpl) return;
+      // Prefer the detail-view textarea; fall back to the new-secret form's notes textarea.
+      const box = document.getElementById('secret-notes')
+        || document.querySelector('form[data-action="save_new"] textarea[name="notes"]');
+      if (!box) return;
+      const existing = box.value.trim();
+      box.value = existing ? (existing + '\n\n' + tpl) : tpl;
+      box.focus();
+      box.setSelectionRange(box.value.length, box.value.length);
     },
 
     async save_new(ev, form) {
@@ -900,61 +1312,6 @@ Usage: base64-decode if stored as binary, then pass to openssl / curl --cert / e
     dismiss_keypair_panel() {
       state.newKeypair = null;
       render();
-    },
-
-    // ---- Secret detail ----
-    toggle_reveal() {
-      const box = document.getElementById('secret-value');
-      if (box) box.classList.toggle('masked');
-    },
-
-    async copy_value() {
-      const box = document.getElementById('secret-value');
-      if (box) await copy(box.value || box.textContent);
-    },
-
-    async copy_notes() {
-      const box = document.getElementById('secret-notes');
-      if (box) await copy(box.value || box.textContent);
-    },
-
-    async copy_ai_prompt(ev, el) {
-      if (!state.currentSecret) return;
-      const mode = (el && el.dataset && el.dataset.mode) === 'inline' ? 'inline' : 'safe';
-      if (mode === 'inline') {
-        const ok = confirm(
-          'You\'re about to copy the raw secret value into your clipboard along with the AI prompt.\n\n' +
-          'If you paste this into an AI chat, the value is transmitted to the AI provider\n' +
-          'and stored in the chat history.\n\n' +
-          'For SSH keys / high-sensitivity secrets, use "Copy AI prompt (safe)" instead,\n' +
-          'which lets the AI fetch the value via curl in a subprocess without exposing it.\n\n' +
-          'Proceed with inline value?'
-        );
-        if (!ok) return;
-      }
-      // Rebuild with latest edits from textareas if the user has typed
-      const valBox = document.getElementById('secret-value');
-      const notesBox = document.getElementById('secret-notes');
-      const sec = {
-        name: state.currentSecret.name,
-        value: valBox ? valBox.value : state.currentSecret.value,
-        notes: notesBox ? notesBox.value : state.currentSecret.notes,
-      };
-      await copy(buildAiPrompt(sec, mode));
-    },
-
-    insert_template(ev, el) {
-      const which = el.dataset.template;
-      const tpl = NOTES_TEMPLATES[which];
-      if (!tpl) return;
-      // Prefer the detail-view textarea; fall back to the new-secret form's notes textarea.
-      const box = document.getElementById('secret-notes')
-        || document.querySelector('form[data-action="save_new"] textarea[name="notes"]');
-      if (!box) return;
-      const existing = box.value.trim();
-      box.value = existing ? (existing + '\n\n' + tpl) : tpl;
-      box.focus();
-      box.setSelectionRange(box.value.length, box.value.length);
     },
 
     async save_secret(ev, form) {
@@ -1044,6 +1401,67 @@ Usage: base64-decode if stored as binary, then pass to openssl / curl --cert / e
     async copy_session_token() { await copy(state.token || ''); },
   };
 
+  // The secret currently open in the detail view, including unsaved textarea edits
+  function currentSecWithEdits() {
+    const valBox = document.getElementById('secret-value');
+    const notesBox = document.getElementById('secret-notes');
+    return {
+      name: state.currentSecret ? state.currentSecret.name : state.currentSecretName,
+      value: valBox ? valBox.value : (state.currentSecret ? state.currentSecret.value : ''),
+      notes: notesBox ? notesBox.value : (state.currentSecret ? state.currentSecret.notes : ''),
+    };
+  }
+
+  function secretDetailHtml(sec) {
+    const notesEmpty = !sec.notes || !sec.notes.trim();
+    return `<div class="bar">
+        <button class="btn ghost" data-action="back_to_dashboard">&larr; Back</button>
+        <div style="flex:1"></div>
+        <button class="btn" data-action="copy_ai_prompt" data-mode="safe" title="Pick an identity (scoped agent key recommended), then copies fetch instructions — the value is NOT in the prompt.">Copy AI prompt (safe)</button>
+        <button class="btn ghost" data-action="copy_ai_prompt" data-mode="inline" title="Copies the prompt WITH the raw value inline. Faster but the value hits the AI provider's logs.">with value</button>
+        <button class="btn ghost" data-action="open_share">Share link</button>
+        <button class="btn danger" data-action="delete_secret">Delete</button>
+      </div>
+      <h1>${esc(sec.name)}</h1>
+      <form data-action="save_secret">
+        <div class="field">
+          <div class="field-head">
+            <label>Value</label>
+            <div class="row fit">
+              <button class="btn ghost sm" type="button" data-action="toggle_reveal">Show / hide</button>
+              <button class="btn ghost sm" type="button" data-action="copy_value">Copy</button>
+            </div>
+          </div>
+          <textarea name="value" class="secret-box masked mono" id="secret-value" rows="3">${esc(sec.value)}</textarea>
+        </div>
+        <div class="field">
+          <div class="field-head">
+            <label>Notes <span class="muted small">(how the AI should use this secret — host, user, decode tips)</span></label>
+            <div class="row fit">
+              <button class="btn ghost sm" type="button" data-action="insert_template" data-template="ssh-key">SSH key</button>
+              <button class="btn ghost sm" type="button" data-action="insert_template" data-template="ssh-password">SSH pw</button>
+              <button class="btn ghost sm" type="button" data-action="insert_template" data-template="database">DB</button>
+              <button class="btn ghost sm" type="button" data-action="insert_template" data-template="api-token">API token</button>
+              <button class="btn ghost sm" type="button" data-action="copy_notes">Copy</button>
+            </div>
+          </div>
+          ${notesEmpty ? `<div class="warn small" style="margin:.25rem 0 .5rem">Notes are empty &mdash; the AI will have to guess which host / user / decoding applies. Click a template above or fill in manually, then save.</div>` : ''}
+          <textarea name="notes" class="mono" id="secret-notes" rows="6" placeholder="Host: 10.0.1.5&#10;User: administrator&#10;Port: 22&#10;Notes: base64-encoded; decode before writing to file.">${esc(sec.notes || '')}</textarea>
+        </div>
+        <div class="error" id="err"></div>
+        <div class="row fit space">
+          <button class="btn">Save changes</button>
+        </div>
+      </form>
+      <hr>
+      <h2>AI prompt preview (safe mode)</h2>
+      <p class="muted small">
+        <strong>Safe mode</strong> (default): the prompt includes a credential + fetch instructions but <em>not</em> the value. Click &ldquo;Copy AI prompt&rdquo; above to pick a <strong>scoped agent</strong> identity &mdash; then the prompt only ever reveals that agent's secrets, not your whole inventory. The preview below uses your session token as a placeholder.<br>
+        <strong>With value</strong>: convenience only. Paste at your own risk for non-sensitive secrets.
+      </p>
+      <pre class="mono" id="ai-preview">${esc(buildAiPrompt(sec, 'safe'))}</pre>`;
+  }
+
   // -------------------- Data loaders --------------------
 
   async function loadDashboardData() {
@@ -1063,6 +1481,16 @@ Usage: base64-decode if stored as binary, then pass to openssl / curl --cert / e
     } catch { /* non-fatal */ }
     render();
     renderTwofaArea();
+  }
+
+  async function loadAgents() {
+    state.agents = await api('GET', '/agents');
+    await loadAudit();
+  }
+
+  async function loadAudit() {
+    try { state.audit = await api('GET', '/audit?limit=100'); }
+    catch { state.audit = []; }
   }
 
   async function loadSecretDetail(name) {

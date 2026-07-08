@@ -11,6 +11,7 @@ app.use(express.json({ limit: '5mb' }));
 const DATA_DIR = process.env.VAULT_DATA || '/data';
 const META_FILE = path.join(DATA_DIR, 'vault.json');
 const SECRETS_DIR = path.join(DATA_DIR, 'secrets');
+const AUDIT_FILE = path.join(DATA_DIR, 'audit.log');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const PORT = process.env.PORT || 3100;
 const VAULT_NAME = process.env.VAULT_NAME || 'Simple Vault';
@@ -65,7 +66,7 @@ const TOKEN_TTL = 30 * 60 * 1000;         // 30 min session
 const SHARE_TTL_DEFAULT = 24 * 60 * 60 * 1000; // 1 day
 const SHARE_TTL_MAX = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-const sessions = new Map(); // token -> { password, expires }
+const sessions = new Map(); // token -> { dek, expires }
 const shares = new Map();   // shareToken -> { name, value, notes, expires, viewsLeft, createdAt }
 const wraps = new Map();    // wrapToken -> { value, expires }
 
@@ -73,6 +74,8 @@ function deriveKey(password, salt) {
   return crypto.pbkdf2Sync(password, salt, KDF_ITERATIONS, KEY_LEN, KDF_DIGEST);
 }
 
+// Password-based envelope (PBKDF2 → AES-GCM). Used only to wrap the DEK and
+// the unlock canary — NOT for secrets (those use the fast DEK envelope below).
 function encrypt(text, password) {
   const salt = crypto.randomBytes(SALT_LEN);
   const iv = crypto.randomBytes(IV_LEN);
@@ -94,6 +97,32 @@ function decrypt(envelope, password) {
   let decrypted = decipher.update(envelope.data, 'hex', 'utf8');
   decrypted += decipher.final('utf8');
   return decrypted;
+}
+
+// DEK envelope: AES-256-GCM with a random 32-byte key used directly (no KDF —
+// the DEK is already full-entropy). Distinguished from password envelopes by
+// the absence of a `salt` field.
+function encryptDek(text, dek) {
+  const iv = crypto.randomBytes(IV_LEN);
+  const cipher = crypto.createCipheriv(ALGO, dek, iv);
+  let encrypted = cipher.update(text, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+  const tag = cipher.getAuthTag();
+  return { iv: iv.toString('hex'), tag: tag.toString('hex'), data: encrypted };
+}
+
+function decryptDek(envelope, dek) {
+  const iv = Buffer.from(envelope.iv, 'hex');
+  const tag = Buffer.from(envelope.tag, 'hex');
+  const decipher = crypto.createDecipheriv(ALGO, dek, iv);
+  decipher.setAuthTag(tag);
+  let decrypted = decipher.update(envelope.data, 'hex', 'utf8');
+  decrypted += decipher.final('utf8');
+  return decrypted;
+}
+
+function sha256hex(s) {
+  return crypto.createHash('sha256').update(s).digest('hex');
 }
 
 // --- TOTP (RFC 6238), HMAC-SHA1, 6 digits, 30 s period ---
@@ -236,21 +265,129 @@ function generateSshEd25519(comment = '') {
 // --- Meta file helpers ---
 function metaExists() { return fs.existsSync(META_FILE); }
 function readMeta() { return JSON.parse(fs.readFileSync(META_FILE, 'utf8')); }
-function writeMeta(obj) { fs.writeFileSync(META_FILE, JSON.stringify(obj, null, 2)); }
+function writeMeta(obj) {
+  // Atomic write: meta holds the wrapped DEK — a torn write would brick the vault.
+  const tmp = META_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+  fs.renameSync(tmp, META_FILE);
+}
+
+// --- Audit log (append-only JSONL) ---
+function audit(req, actor, action, target, ok, extra) {
+  try {
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      actor,                       // 'master' | 'agent:<name>'
+      action,                      // 'read' | 'write' | 'delete' | 'list' | 'share' | 'unlock' | ...
+      target: target || null,      // secret name / agent name
+      ip: clientIp(req),
+      ok: ok !== false,
+      ...(extra || {})
+    }) + '\n';
+    fs.appendFileSync(AUDIT_FILE, line);
+  } catch { /* audit must never break the request */ }
+}
+
+function readAuditTail(limit) {
+  if (!fs.existsSync(AUDIT_FILE)) return [];
+  const lines = fs.readFileSync(AUDIT_FILE, 'utf8').trim().split('\n').filter(Boolean);
+  return lines.slice(-limit).reverse().map(l => {
+    try { return JSON.parse(l); } catch { return null; }
+  }).filter(Boolean);
+}
 
 // --- Auth middleware ---
+// Two credential types:
+//   x-vault-token — human session from /unlock (full access, manages agents)
+//   x-vault-key   — long-lived agent key (svk_...), policy-scoped
 function auth(req, res, next) {
   const token = req.headers['x-vault-token'];
-  if (!token) return res.status(401).json({ error: 'Missing x-vault-token header' });
-  const session = sessions.get(token);
-  if (!session || Date.now() > session.expires) {
-    sessions.delete(token);
-    return res.status(401).json({ error: 'Invalid or expired token' });
+  const agentKey = req.headers['x-vault-key'];
+
+  if (token) {
+    const session = sessions.get(token);
+    if (!session || Date.now() > session.expires) {
+      sessions.delete(token);
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    session.expires = Date.now() + TOKEN_TTL;
+    req.dek = session.dek;
+    req.actor = { type: 'master', label: 'master' };
+    req.vaultToken = token;
+    return next();
   }
-  session.expires = Date.now() + TOKEN_TTL;
-  req.vaultPassword = session.password;
-  req.vaultToken = token;
-  next();
+
+  if (agentKey) {
+    if (!metaExists()) return res.status(401).json({ error: 'Vault not initialized' });
+    const meta = readMeta();
+    const agents = meta.agents || {};
+    const hash = sha256hex(agentKey);
+    const id = Object.keys(agents).find(k => timingSafeEqStr(agents[k].key_hash, hash));
+    const agent = id ? agents[id] : null;
+    if (!agent) return res.status(401).json({ error: 'Invalid agent key' });
+    if (agent.disabled) return res.status(403).json({ error: 'Agent is disabled' });
+    if (agent.expires_at && Date.now() > new Date(agent.expires_at).getTime()) {
+      return res.status(403).json({ error: 'Agent key expired' });
+    }
+    let dek;
+    try { dek = Buffer.from(decrypt(agent.dek_wrapped, agentKey), 'hex'); }
+    catch { return res.status(500).json({ error: 'Key unwrap failed' }); }
+    req.dek = dek;
+    req.actor = { type: 'agent', id, agent, label: `agent:${agent.name}` };
+    // last_used bookkeeping (cheap: at most once per minute per agent)
+    const now = Date.now();
+    if (!agent.last_used || now - new Date(agent.last_used).getTime() > 60 * 1000) {
+      agent.last_used = new Date(now).toISOString();
+      try { writeMeta(meta); } catch { /* non-fatal */ }
+    }
+    return next();
+  }
+
+  return res.status(401).json({ error: 'Missing x-vault-token or x-vault-key header' });
+}
+
+// Routes that only the human (master session) may call
+function masterOnly(req, res, next) {
+  if (req.actor && req.actor.type === 'master') return next();
+  audit(req, req.actor ? req.actor.label : '?', 'denied', req.path, false);
+  return res.status(403).json({ error: 'This operation requires a master session (x-vault-token)' });
+}
+
+// --- Policy: glob patterns over secret names ---
+// pattern "strapi.*" matches strapi.v3-db etc.; "*" matches everything.
+function globToRegex(pattern) {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+  return new RegExp('^' + escaped + '$');
+}
+
+function validPolicy(policy) {
+  if (!Array.isArray(policy) || policy.length === 0) return false;
+  const PERMS = ['read', 'write', 'delete'];
+  return policy.every(rule =>
+    rule && typeof rule.pattern === 'string' && rule.pattern.length > 0 && rule.pattern.length <= 200
+    && /^[a-zA-Z0-9._*?-]+$/.test(rule.pattern)
+    && Array.isArray(rule.perms) && rule.perms.length > 0
+    && rule.perms.every(p => PERMS.includes(p))
+  );
+}
+
+function agentCan(agent, perm, name) {
+  return (agent.policy || []).some(rule =>
+    rule.perms.includes(perm) && globToRegex(rule.pattern).test(name)
+  );
+}
+
+// Permission gate for secret routes. Master always passes.
+function requirePerm(perm) {
+  return (req, res, next) => {
+    if (req.actor.type === 'master') return next();
+    const name = req.params.name;
+    if (!agentCan(req.actor.agent, perm, name)) {
+      audit(req, req.actor.label, perm, name, false, { denied: true });
+      return res.status(403).json({ error: `Agent "${req.actor.agent.name}" is not allowed to ${perm} "${name}"` });
+    }
+    next();
+  };
 }
 
 // --- Secret helpers ---
@@ -265,25 +402,66 @@ function secretPath(name) {
   return path.join(SECRETS_DIR, name + '.enc');
 }
 
-// New on-disk format: { value: envelope, notes?: envelope }
-// Old format (still supported on read): envelope itself i.e. { salt, iv, tag, data }
-function writeSecret(name, value, notes, password) {
-  fs.mkdirSync(SECRETS_DIR, { recursive: true });
-  const out = { value: encrypt(value, password) };
-  if (notes) out.notes = encrypt(notes, password);
-  fs.writeFileSync(secretPath(name), JSON.stringify(out, null, 2));
+function listSecretNames() {
+  if (!fs.existsSync(SECRETS_DIR)) return [];
+  return fs.readdirSync(SECRETS_DIR)
+    .filter(f => f.endsWith('.enc'))
+    .map(f => f.slice(0, -4))
+    .sort();
 }
 
-function readSecret(name, password) {
+// On-disk format v2: { v: 2, value: dekEnvelope, notes?: dekEnvelope } — DEK-encrypted.
+// Legacy formats (password-encrypted, migrated at unlock):
+//   v1b: { value: pwEnvelope, notes?: pwEnvelope }
+//   v1a: pwEnvelope itself, i.e. { salt, iv, tag, data }
+function writeSecret(name, value, notes, dek) {
+  fs.mkdirSync(SECRETS_DIR, { recursive: true });
+  const out = { v: 2, value: encryptDek(value, dek) };
+  if (notes) out.notes = encryptDek(notes, dek);
+  const fp = secretPath(name);
+  fs.writeFileSync(fp + '.tmp', JSON.stringify(out, null, 2));
+  fs.renameSync(fp + '.tmp', fp);
+}
+
+function readSecret(name, dek) {
   const raw = JSON.parse(fs.readFileSync(secretPath(name), 'utf8'));
+  if (raw.v !== 2) throw new Error('Secret not migrated to v2 — unlock with the master password once to migrate');
+  return {
+    value: decryptDek(raw.value, dek),
+    notes: raw.notes ? decryptDek(raw.notes, dek) : ''
+  };
+}
+
+// Legacy read (password-based), used only during migration
+function readSecretLegacy(name, password) {
+  const raw = JSON.parse(fs.readFileSync(secretPath(name), 'utf8'));
+  if (raw.v === 2) return null; // already migrated
   if (raw.salt && raw.data && !raw.value) {
-    // Legacy single-envelope format
     return { value: decrypt(raw, password), notes: '' };
   }
   return {
     value: decrypt(raw.value, password),
     notes: raw.notes ? decrypt(raw.notes, password) : ''
   };
+}
+
+// Migrate everything password-encrypted → DEK-encrypted. Runs at unlock.
+// Idempotent; skips already-migrated files; throws only if a decrypt fails.
+function migrateToDek(meta, password, dek) {
+  let migrated = 0;
+  for (const name of listSecretNames()) {
+    const legacy = readSecretLegacy(name, password);
+    if (!legacy) continue;
+    writeSecret(name, legacy.value, legacy.notes, dek);
+    migrated++;
+  }
+  // TOTP secret: re-wrap under DEK
+  for (const field of ['totp', 'totp_pending']) {
+    if (meta[field] && meta[field].salt) {
+      meta[field] = encryptDek(decrypt(meta[field], password), dek);
+    }
+  }
+  return migrated;
 }
 
 function baseUrl(req) {
@@ -314,32 +492,69 @@ app.post('/init', rateLimit, (req, res) => {
   if (metaExists()) return res.status(409).json({ error: 'Vault already initialized' });
   const { password } = req.body || {};
   if (!password || password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  const dek = crypto.randomBytes(KEY_LEN);
   const verify = encrypt('vault-ok', password);
+  const dek_wrapped = encrypt(dek.toString('hex'), password);
   fs.mkdirSync(SECRETS_DIR, { recursive: true });
-  writeMeta({ verify });
+  writeMeta({ schema: 2, verify, dek_wrapped, agents: {} });
   res.json({ message: 'Vault initialized' });
 });
 
 // Unlock — returns a session token. Requires TOTP if 2FA is active.
+// Transparently migrates a legacy (password-encrypted) vault to DEK envelopes.
 app.post('/unlock', rateLimit, (req, res) => {
   if (!metaExists()) return res.status(400).json({ error: 'Vault not initialized' });
   const { password, totp } = req.body || {};
   if (!password) return res.status(400).json({ error: 'Password required' });
   const meta = readMeta();
-  let activeTotp = null;
   try {
     if (decrypt(meta.verify, password) !== 'vault-ok') throw new Error();
-    if (meta.totp) activeTotp = decrypt(meta.totp, password);
   } catch {
+    audit(req, 'master', 'unlock', null, false);
     return res.status(403).json({ error: 'Wrong password' });
   }
-  if (activeTotp) {
-    if (!totp) return res.status(403).json({ error: 'TOTP code required', totp_required: true });
-    if (!verifyTotp(activeTotp, totp)) return res.status(403).json({ error: 'Wrong TOTP code', totp_required: true });
+
+  // Obtain (or create) the DEK
+  let dek, migratedCount = 0;
+  if (meta.dek_wrapped) {
+    try { dek = Buffer.from(decrypt(meta.dek_wrapped, password), 'hex'); }
+    catch { return res.status(500).json({ error: 'DEK unwrap failed' }); }
+    // Late-arriving legacy files (e.g. restored from backup) still get migrated
+    try { migratedCount = migrateToDek(meta, password, dek); } catch (e) {
+      return res.status(500).json({ error: 'Migration failed: ' + e.message });
+    }
+    if (migratedCount > 0) writeMeta(meta);
+  } else {
+    // First unlock after upgrade: generate DEK and migrate everything
+    dek = crypto.randomBytes(KEY_LEN);
+    try { migratedCount = migrateToDek(meta, password, dek); } catch (e) {
+      return res.status(500).json({ error: 'Migration failed: ' + e.message });
+    }
+    meta.schema = 2;
+    meta.dek_wrapped = encrypt(dek.toString('hex'), password);
+    meta.agents = meta.agents || {};
+    writeMeta(meta);
   }
+
+  // TOTP check (after DEK so we can decrypt DEK-wrapped totp)
+  if (meta.totp) {
+    let activeTotp;
+    try {
+      activeTotp = meta.totp.salt ? decrypt(meta.totp, password) : decryptDek(meta.totp, dek);
+    } catch {
+      return res.status(500).json({ error: 'TOTP decrypt failed' });
+    }
+    if (!totp) return res.status(403).json({ error: 'TOTP code required', totp_required: true });
+    if (!verifyTotp(activeTotp, totp)) {
+      audit(req, 'master', 'unlock', null, false, { reason: 'totp' });
+      return res.status(403).json({ error: 'Wrong TOTP code', totp_required: true });
+    }
+  }
+
   const token = crypto.randomBytes(32).toString('hex');
-  sessions.set(token, { password, expires: Date.now() + TOKEN_TTL });
-  res.json({ token, expires_in: TOKEN_TTL / 1000, totp_enabled: !!activeTotp });
+  sessions.set(token, { dek, expires: Date.now() + TOKEN_TTL });
+  audit(req, 'master', 'unlock', null, true, migratedCount ? { migrated: migratedCount } : undefined);
+  res.json({ token, expires_in: TOKEN_TTL / 1000, totp_enabled: !!meta.totp, migrated: migratedCount });
 });
 
 // Lock — invalidate the current session token
@@ -349,13 +564,12 @@ app.post('/lock', (req, res) => {
   res.json({ message: 'Locked' });
 });
 
-// --- 2FA (TOTP) ---
+// --- 2FA (TOTP) --- (master only; secrets wrapped under DEK)
 
-// Start 2FA setup: generate a fresh secret, store it as "pending"
-app.post('/2fa/setup', auth, async (req, res) => {
+app.post('/2fa/setup', auth, masterOnly, async (req, res) => {
   const meta = readMeta();
   const secret = generateTotpSecret();
-  meta.totp_pending = encrypt(secret, req.vaultPassword);
+  meta.totp_pending = encryptDek(secret, req.dek);
   writeMeta(meta);
   const label = typeof req.body?.label === 'string' && req.body.label.length > 0 ? req.body.label : 'vault';
   const uri = totpUri(secret, label, VAULT_NAME);
@@ -368,13 +582,12 @@ app.post('/2fa/setup', auth, async (req, res) => {
   }
 });
 
-// Confirm 2FA setup: verify the code, then promote pending -> active
-app.post('/2fa/confirm', auth, (req, res) => {
+app.post('/2fa/confirm', auth, masterOnly, (req, res) => {
   const meta = readMeta();
   if (!meta.totp_pending) return res.status(400).json({ error: 'No pending 2FA setup' });
   const { totp } = req.body || {};
   let secret;
-  try { secret = decrypt(meta.totp_pending, req.vaultPassword); }
+  try { secret = decryptDek(meta.totp_pending, req.dek); }
   catch { return res.status(500).json({ error: 'Decryption failed' }); }
   if (!verifyTotp(secret, totp)) return res.status(403).json({ error: 'Wrong TOTP code' });
   meta.totp = meta.totp_pending;
@@ -383,14 +596,14 @@ app.post('/2fa/confirm', auth, (req, res) => {
   res.json({ message: '2FA enabled' });
 });
 
-// Disable 2FA — requires a valid current TOTP to prevent accidental removal
-app.post('/2fa/disable', auth, (req, res) => {
+app.post('/2fa/disable', auth, masterOnly, (req, res) => {
   const meta = readMeta();
   if (!meta.totp) return res.status(400).json({ error: '2FA not enabled' });
   const { totp } = req.body || {};
   let secret;
-  try { secret = decrypt(meta.totp, req.vaultPassword); }
+  try { secret = meta.totp.salt ? null : decryptDek(meta.totp, req.dek); }
   catch { return res.status(500).json({ error: 'Decryption failed' }); }
+  if (secret === null) return res.status(409).json({ error: 'Vault not migrated — unlock again first' });
   if (!verifyTotp(secret, totp)) return res.status(403).json({ error: 'Wrong TOTP code' });
   delete meta.totp;
   delete meta.totp_pending;
@@ -406,15 +619,13 @@ app.get('/info', auth, (req, res) => {
     url: baseUrl(req),
     domain: VAULT_DOMAIN || req.hostname,
     hostname: req.hostname,
-    token_ttl_seconds: TOKEN_TTL / 1000
+    token_ttl_seconds: TOKEN_TTL / 1000,
+    actor: req.actor.label
   });
 });
 
 // --- Keypair generator (stateless — vault never persists the output) ---
-// Generates an ed25519 SSH keypair server-side so the user doesn't need
-// ssh-keygen locally. Returns the private key PEM (OpenSSH format) plus a
-// base64-encoded version ready to paste into a secret's "value" field.
-app.post('/keygen', auth, (req, res) => {
+app.post('/keygen', auth, masterOnly, (req, res) => {
   const { type = 'ed25519', comment = '' } = req.body || {};
   if (type !== 'ed25519') {
     return res.status(400).json({ error: 'Only ed25519 is supported.' });
@@ -434,18 +645,138 @@ app.post('/keygen', auth, (req, res) => {
   });
 });
 
+// --- Agents (master only) ---
+
+function publicAgent(id, a, matchedNames) {
+  return {
+    id,
+    name: a.name,
+    policy: a.policy,
+    prompt_notes: a.prompt_notes || '',
+    created: a.created,
+    expires_at: a.expires_at || null,
+    last_used: a.last_used || null,
+    disabled: !!a.disabled,
+    matched_secrets: matchedNames
+  };
+}
+
+function agentMatchedNames(a) {
+  const names = listSecretNames();
+  return names.filter(n => agentCan(a, 'read', n) || agentCan(a, 'write', n) || agentCan(a, 'delete', n));
+}
+
+app.get('/agents', auth, masterOnly, (req, res) => {
+  const meta = readMeta();
+  const agents = meta.agents || {};
+  res.json(Object.entries(agents).map(([id, a]) => publicAgent(id, a, agentMatchedNames(a))));
+});
+
+const AGENT_NAME_RE = /^[a-zA-Z0-9._-]{1,60}$/;
+
+app.post('/agents', auth, masterOnly, (req, res) => {
+  const { name, policy, expires_days, prompt_notes } = req.body || {};
+  if (!AGENT_NAME_RE.test(String(name || ''))) {
+    return res.status(400).json({ error: 'Invalid agent name. Use a-z A-Z 0-9 . _ - (max 60 chars).' });
+  }
+  if (!validPolicy(policy)) {
+    return res.status(400).json({ error: 'Invalid policy. Expected [{pattern, perms:["read"|"write"|"delete", ...]}, ...]' });
+  }
+  if (prompt_notes !== undefined && (typeof prompt_notes !== 'string' || prompt_notes.length > 5000)) {
+    return res.status(400).json({ error: 'prompt_notes must be a string up to 5000 chars' });
+  }
+  const meta = readMeta();
+  meta.agents = meta.agents || {};
+  if (Object.values(meta.agents).some(a => a.name === name)) {
+    return res.status(409).json({ error: `An agent named "${name}" already exists` });
+  }
+  const id = crypto.randomBytes(8).toString('hex');
+  const key = 'svk_' + crypto.randomBytes(32).toString('hex');
+  const agent = {
+    name,
+    key_hash: sha256hex(key),
+    dek_wrapped: encrypt(req.dek.toString('hex'), key), // DEK wrapped under the agent key
+    policy,
+    prompt_notes: prompt_notes || '',
+    created: new Date().toISOString(),
+    expires_at: Number.isInteger(expires_days) && expires_days > 0
+      ? new Date(Date.now() + expires_days * 86400000).toISOString() : null
+  };
+  meta.agents[id] = agent;
+  writeMeta(meta);
+  audit(req, 'master', 'agent_create', name, true);
+  // The key is returned exactly once — only its hash is stored.
+  res.json({ ...publicAgent(id, agent, agentMatchedNames(agent)), key });
+});
+
+app.patch('/agents/:id', auth, masterOnly, (req, res) => {
+  const meta = readMeta();
+  const agent = (meta.agents || {})[req.params.id];
+  if (!agent) return res.status(404).json({ error: 'Agent not found' });
+  const { policy, prompt_notes, disabled, expires_days } = req.body || {};
+  if (policy !== undefined) {
+    if (!validPolicy(policy)) return res.status(400).json({ error: 'Invalid policy' });
+    agent.policy = policy;
+  }
+  if (prompt_notes !== undefined) {
+    if (typeof prompt_notes !== 'string' || prompt_notes.length > 5000) {
+      return res.status(400).json({ error: 'prompt_notes must be a string up to 5000 chars' });
+    }
+    agent.prompt_notes = prompt_notes;
+  }
+  if (disabled !== undefined) agent.disabled = !!disabled;
+  if (expires_days !== undefined) {
+    agent.expires_at = Number.isInteger(expires_days) && expires_days > 0
+      ? new Date(Date.now() + expires_days * 86400000).toISOString() : null;
+  }
+  writeMeta(meta);
+  audit(req, 'master', 'agent_update', agent.name, true);
+  res.json(publicAgent(req.params.id, agent, agentMatchedNames(agent)));
+});
+
+// Rotate: mint a new key for an existing agent (old key stops working immediately)
+app.post('/agents/:id/rotate', auth, masterOnly, (req, res) => {
+  const meta = readMeta();
+  const agent = (meta.agents || {})[req.params.id];
+  if (!agent) return res.status(404).json({ error: 'Agent not found' });
+  const key = 'svk_' + crypto.randomBytes(32).toString('hex');
+  agent.key_hash = sha256hex(key);
+  agent.dek_wrapped = encrypt(req.dek.toString('hex'), key);
+  writeMeta(meta);
+  audit(req, 'master', 'agent_rotate', agent.name, true);
+  res.json({ ...publicAgent(req.params.id, agent, agentMatchedNames(agent)), key });
+});
+
+app.delete('/agents/:id', auth, masterOnly, (req, res) => {
+  const meta = readMeta();
+  const agent = (meta.agents || {})[req.params.id];
+  if (!agent) return res.status(404).json({ error: 'Agent not found' });
+  delete meta.agents[req.params.id];
+  writeMeta(meta);
+  audit(req, 'master', 'agent_revoke', agent.name, true);
+  res.json({ message: 'Agent revoked', name: agent.name });
+});
+
+// --- Audit log (master only) ---
+app.get('/audit', auth, masterOnly, (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
+  res.json(readAuditTail(limit));
+});
+
 // --- Secrets ---
 
-app.get('/secrets', auth, (_req, res) => {
-  if (!fs.existsSync(SECRETS_DIR)) return res.json([]);
-  const names = fs.readdirSync(SECRETS_DIR)
-    .filter(f => f.endsWith('.enc'))
-    .map(f => f.slice(0, -4))
-    .sort();
+app.get('/secrets', auth, (req, res) => {
+  let names = listSecretNames();
+  if (req.actor.type === 'agent') {
+    // Agents see only what their policy matches — the rest of the inventory
+    // is invisible to them (and to whatever AI chat their key is pasted into).
+    names = names.filter(n => agentCan(req.actor.agent, 'read', n) || agentCan(req.actor.agent, 'write', n));
+  }
+  audit(req, req.actor.label, 'list', null, true, { count: names.length });
   res.json(names);
 });
 
-app.post('/secrets/:name', auth, (req, res) => {
+app.post('/secrets/:name', auth, requirePerm('write'), (req, res) => {
   const { name } = req.params;
   if (!validName(name)) return res.status(400).json({ error: 'Invalid name. Use a-z A-Z 0-9 . _ - (max 200 chars).' });
   const { value, notes } = req.body || {};
@@ -457,16 +788,18 @@ app.post('/secrets/:name', auth, (req, res) => {
   if (notes !== undefined && notes !== null && typeof notes !== 'string') {
     return res.status(400).json({ error: 'notes must be a string' });
   }
-  writeSecret(name, value, notes || '', req.vaultPassword);
+  writeSecret(name, value, notes || '', req.dek);
+  audit(req, req.actor.label, 'write', name, true);
   res.json({ message: 'Saved', name });
 });
 
-app.get('/secrets/:name', auth, (req, res) => {
+app.get('/secrets/:name', auth, requirePerm('read'), (req, res) => {
   const { name } = req.params;
   if (!validName(name)) return res.status(400).json({ error: 'Invalid name' });
   if (!fs.existsSync(secretPath(name))) return res.status(404).json({ error: 'Not found' });
   try {
-    const { value, notes } = readSecret(name, req.vaultPassword);
+    const { value, notes } = readSecret(name, req.dek);
+    audit(req, req.actor.label, 'read', name, true, req.query.wrap === 'true' ? { wrap: true } : undefined);
 
     // Response wrapping: return a one-time token instead of the raw value.
     // The AI sees only the token; the actual secret is retrieved via
@@ -480,13 +813,14 @@ app.get('/secrets/:name', auth, (req, res) => {
         wrap_token: wrapToken,
         expires_in: WRAP_TTL / 1000,
         unwrap_url: `${baseUrl(req)}/unwrap/${wrapToken}`,
+        notes,
         hint: 'curl -s <unwrap_url> > /tmp/secret  # one-time use, raw value, no JSON'
       });
     }
 
     res.json({ name, value, notes });
-  } catch {
-    res.status(500).json({ error: 'Decryption failed' });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Decryption failed' });
   }
 });
 
@@ -504,18 +838,19 @@ app.get('/unwrap/:token', (req, res) => {
   res.type('text/plain').send(value);
 });
 
-app.delete('/secrets/:name', auth, (req, res) => {
+app.delete('/secrets/:name', auth, requirePerm('delete'), (req, res) => {
   const { name } = req.params;
   if (!validName(name)) return res.status(400).json({ error: 'Invalid name' });
   const fp = secretPath(name);
   if (!fs.existsSync(fp)) return res.status(404).json({ error: 'Not found' });
   fs.unlinkSync(fp);
+  audit(req, req.actor.label, 'delete', name, true);
   res.json({ message: 'Deleted', name });
 });
 
-// --- One-time share links ---
+// --- One-time share links (master only) ---
 // Share-created secrets live in memory only; a vault restart invalidates every link.
-app.post('/secrets/:name/share', auth, (req, res) => {
+app.post('/secrets/:name/share', auth, masterOnly, (req, res) => {
   const { name } = req.params;
   if (!validName(name)) return res.status(400).json({ error: 'Invalid name' });
   if (!fs.existsSync(secretPath(name))) return res.status(404).json({ error: 'Not found' });
@@ -526,7 +861,7 @@ app.post('/secrets/:name/share', auth, (req, res) => {
   }
   const views = Number.isInteger(max_views) && max_views > 0 ? Math.min(max_views, 100) : 1;
   let secretData;
-  try { secretData = readSecret(name, req.vaultPassword); }
+  try { secretData = readSecret(name, req.dek); }
   catch { return res.status(500).json({ error: 'Decryption failed' }); }
   const shareToken = crypto.randomBytes(24).toString('hex');
   shares.set(shareToken, {
@@ -537,6 +872,7 @@ app.post('/secrets/:name/share', auth, (req, res) => {
     viewsLeft: views,
     createdAt: Date.now()
   });
+  audit(req, 'master', 'share', name, true, { ttl: Math.floor(ttl / 1000), views });
   res.json({
     share_token: shareToken,
     url: `${baseUrl(req)}/shared/${shareToken}`,
@@ -619,7 +955,7 @@ setInterval(() => {
   for (const [t, s] of sessions) if (now > s.expires) sessions.delete(t);
   for (const [t, s] of shares) if (now > s.expires || s.viewsLeft <= 0) shares.delete(t);
   for (const [t, w] of wraps) if (now > w.expires) wraps.delete(t);
-}, 5 * 60 * 1000);
+}, 5 * 60 * 1000).unref();
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Simple Vault running on port ${PORT}`);

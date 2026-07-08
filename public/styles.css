@@ -453,3 +453,19 @@ hr {
   .app-header .brand span { display: none; }
   .panel { padding: 1.25rem; }
 }
+
+/* ---- Agents ---- */
+.tag.bad { color: var(--danger, #f85149); border-color: var(--danger, #f85149); background: rgba(248, 81, 73, 0.08); }
+.warn-text { color: #d29922; }
+.accent { color: var(--accent, #2ea043); }
+.active-tab { border-color: var(--accent, #2ea043) !important; color: var(--accent, #2ea043) !important; }
+.agent-card { cursor: default; }
+.agent-card:hover { background: inherit; }
+.check-row { display: flex; align-items: center; gap: .5rem; margin: .25rem 0; font-weight: normal; }
+.check-row input { width: auto; margin: 0; }
+.scope-picker { max-height: 160px; overflow-y: auto; border: 1px solid var(--border, #30363d); border-radius: 8px; padding: .5rem .75rem; margin: .5rem 0; }
+.audit-list { border: 1px solid var(--border, #30363d); border-radius: 8px; max-height: 320px; overflow-y: auto; }
+.audit-row { display: grid; grid-template-columns: 150px 140px 110px 1fr 110px; gap: .5rem; padding: .3rem .6rem; border-bottom: 1px solid var(--border, #30363d); overflow: hidden; }
+.audit-row:last-child { border-bottom: 0; }
+.audit-row span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 700px) { .audit-row { grid-template-columns: 1fr 1fr; } }

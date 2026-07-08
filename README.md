@@ -8,9 +8,23 @@ or Bitwarden. Think "password-protected encrypted blob store you can `curl`."
 
 ## Features
 
+- **Agents — scoped keys for AI assistants and automation.** Each agent
+  gets its own long-lived `svk_` key restricted by glob policies
+  (`strapi.*` → read-only). An agent can only *see* the secrets its policy
+  matches — `GET /secrets` under an agent key returns nothing else, so a
+  pasted prompt never leaks your full inventory. One-click revoke and
+  rotate; every access is written to an append-only audit log.
 - **Web UI** at `/ui/` — signup wizard, login, dashboard, per-secret detail
-  view, settings page, and a one-click **AI prompt helper** that builds a
-  paste-ready block for Claude / ChatGPT / Cursor etc.
+  view, an **Agents tab**, settings page, and a one-click **AI prompt
+  helper** that builds a paste-ready block for Claude / ChatGPT / Cursor
+  etc. using a scoped agent identity.
+- **Envelope encryption (DEK).** Secrets are encrypted with a random
+  256-bit data-encryption key; the DEK is wrapped under your master
+  password and under each agent key. Legacy (v1) vaults migrate
+  automatically on the first unlock.
+- **Response wrapping** — `GET /secrets/<name>?wrap=true` returns a
+  one-time unwrap URL instead of the value, so even the AI's fetch output
+  never contains the plaintext in JSON it reads.
 - **2FA (TOTP)** — optional time-based codes on top of the master password.
   Set up during signup or later from Settings. Works with any standard
   authenticator app (Google Authenticator, Authy, 1Password, etc.).
@@ -20,10 +34,12 @@ or Bitwarden. Think "password-protected encrypted blob store you can `curl`."
 - **Per-secret notes** — attach free-form context to each secret (target
   hostname, username, usage hints). The notes are encrypted alongside the
   value and are what the AI-prompt helper pastes as instructions to the LLM.
-- **AES-256-GCM** encryption with **PBKDF2** key derivation (100k iterations, SHA-512)
-- Password-based master key — the password itself is never stored, only a
+- **AES-256-GCM** everywhere; **PBKDF2** (100k iterations, SHA-512) for the
+  password → DEK wrap. The password itself is never stored, only a
   `vault-ok` canary encrypted with it, used to verify unlock attempts
-- 30-minute session tokens, auto-extended on activity
+- 30-minute session tokens (human), long-lived scoped agent keys (machines)
+- **Append-only audit log** — who (master or which agent) did what to
+  which secret, from which IP, including denied attempts
 - In-memory rate limiting: 5 `/init` + `/unlock` attempts per IP per 15 min
 - Optional IP allowlist (works correctly behind Cloudflare via `CF-Connecting-IP`)
 - Fully Dockerized; Caddy handles Let's Encrypt certificates automatically
@@ -35,9 +51,16 @@ or Bitwarden. Think "password-protected encrypted blob store you can `curl`."
 ```
 Client ──HTTPS──► Caddy (443/tcp) ──HTTP──► Node/Express (3100/tcp) ──► /data volume
                    │                                                      │
-                   └── Let's Encrypt (auto-renew)                         └── one .enc file per secret
-                                                                              (AES-256-GCM envelopes)
+                   └── Let's Encrypt (auto-renew)                         ├── one .enc file per secret (AES-256-GCM, DEK)
+                                                                          ├── vault.json (wrapped DEK, agents, TOTP)
+                                                                          └── audit.log (append-only JSONL)
 ```
+
+**Key hierarchy:** a random 256-bit **DEK** encrypts every secret. The DEK is
+stored wrapped (encrypted) under the master password, and additionally under
+each agent key. Unlocking with the password — or presenting a valid agent
+key — unwraps the same DEK. Only a SHA-256 hash of each agent key is stored,
+so a stolen `vault.json` alone unlocks nothing.
 
 Caddy and the vault each run in their own Docker container, sharing a private
 Compose network. Only Caddy publishes ports to the host (80/443).
@@ -156,6 +179,14 @@ password, all stored secrets, and (if enabled) your TOTP configuration
 survive the upgrade. Active session tokens are wiped — they're in-memory
 only — so log in again after the restart. Caddy is not rebuilt (it has
 no code changes), so your Let's Encrypt cert stays intact.
+
+**Upgrading from v1 (pre-agents) to v2:** back up the volume first
+(`docker run --rm -v <stack>_vault-data:/data -v /var/backups:/out alpine tar czf /out/vault-pre-v2.tgz -C /data .`).
+The first `/unlock` with your master password transparently migrates every
+secret from password-encryption to DEK envelopes and writes the wrapped DEK
+into `vault.json`. The migration is idempotent and the unlock response
+reports `"migrated": <count>`. Until that first unlock, agent keys cannot
+be created (there is no DEK yet) — everything else keeps working.
 
 ## Web UI
 
@@ -428,6 +459,57 @@ curl -s https://vault.example.com/secrets/ssh.myhost.id_ed25519 \
   | ssh-keygen -lf /dev/stdin                               # from vault
 ```
 
+## Agents — scoped keys for AI assistants
+
+The core problem with a single master credential: any AI chat you paste it
+into can read *every* secret, and the generated prompt lists your whole
+inventory. Agents fix both.
+
+An **agent** is a named identity (`hermes`, `seo-bot`, `local-claude`) with:
+
+- its own long-lived key (`svk_…`) — only a SHA-256 hash is stored; the key
+  is shown exactly once at creation/rotation
+- a **policy**: glob patterns over secret names with `read` / `write` /
+  `delete` perms, e.g. `[{"pattern":"strapi.*","perms":["read"]}]`
+- **list isolation**: `GET /secrets` with `x-vault-key` returns only the
+  names its policy matches — the rest of the vault is invisible
+- optional **expiry**, one-click **disable / rotate / revoke**
+- a **prompt notes** field: standing instructions embedded in every AI
+  prompt generated for this agent (project paths, house rules, …)
+
+### Creating one (UI)
+
+Agents tab → **+ New agent** → name it, type scope patterns (live preview
+shows which secrets match), pick read-only or read+write, optional expiry
+→ **Create**. The key appears once, alongside a **Copy AI prompt (safe)**
+button that builds a paste-ready block scoped to just that agent.
+
+From a secret's detail page, **Copy AI prompt** opens a picker: use an
+existing agent that covers the secret, create a read-only agent for it in
+one step, or fall back to the full-access session token. Copying a prompt
+for an existing agent **rotates its key** (so the prompt contains a working
+credential and the old one dies) — the UI warns before doing so.
+
+### Creating one (API)
+
+```bash
+# master session required
+curl -X POST "$URL/agents" -H "x-vault-token: $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"hermes","policy":[{"pattern":"strapi.*","perms":["read"]}],
+       "expires_days":90,"prompt_notes":"Strapi lives at /root/strapi/"}'
+# => { "id":"…", "key":"svk_…", ... }   ← key shown ONCE
+
+# the agent then authenticates with x-vault-key:
+curl "$URL/secrets" -H "x-vault-key: svk_…"          # only strapi.* names
+curl "$URL/secrets/strapi.v3-db?wrap=true" -H "x-vault-key: svk_…"
+```
+
+### Audit log
+
+Every list/read/write/delete/denial — by master or by any agent — is
+appended to `/data/audit.log` (JSONL) and shown in the Agents tab.
+`GET /audit?limit=200` (master only) returns the newest entries.
+
 ## Using with AI agents, CI jobs, and scripts
 
 Core idea: **API keys live in the vault, and short-lived processes fetch them
@@ -675,10 +757,20 @@ the decryption key via PBKDF2 with the same salts stored in the tarball.
 | POST   | `/2fa/setup`              | yes  | `{ "label"? }`                                              | Generate pending TOTP secret; returns base32 + QR data-URL |
 | POST   | `/2fa/confirm`            | yes  | `{ "totp" }`                                                | Activate 2FA after scanning the QR                       |
 | POST   | `/2fa/disable`            | yes  | `{ "totp" }`                                                | Disable 2FA (requires a valid current code)              |
-| POST   | `/keygen`                 | yes  | `{ "type"?, "comment"? }`                                   | Generate ed25519 SSH keypair server-side. Returns public line + OpenSSH PEM + base64. **Stateless** — vault does NOT persist the output. |
+| POST   | `/keygen`                 | master | `{ "type"?, "comment"? }`                                 | Generate ed25519 SSH keypair server-side. Returns public line + OpenSSH PEM + base64. **Stateless** — vault does NOT persist the output. |
+| GET    | `/agents`                 | master | —                                                         | List agents (id, policy, matched secrets, last used)     |
+| POST   | `/agents`                 | master | `{ "name", "policy", "expires_days"?, "prompt_notes"? }`  | Create agent; response contains the key **once**         |
+| PATCH  | `/agents/:id`             | master | `{ "policy"?, "prompt_notes"?, "disabled"?, "expires_days"? }` | Update policy / disable / re-expire                 |
+| POST   | `/agents/:id/rotate`      | master | —                                                         | Mint a new key (old key dies); response contains it once |
+| DELETE | `/agents/:id`             | master | —                                                         | Revoke agent permanently                                 |
+| GET    | `/audit?limit=N`          | master | —                                                         | Newest N audit entries (max 1000)                        |
+| GET    | `/unwrap/:token`          | no   | —                                                           | One-time raw-text retrieval of a wrapped read            |
 | GET    | `/ui/`                    | no   | —                                                           | Static web UI (SPA)                                      |
 
-\* Rate-limited per IP. Authed routes require `x-vault-token: <token>`.
+\* Rate-limited per IP. Authed routes accept `x-vault-token: <session>` (full
+access) or `x-vault-key: <svk_agent_key>` (policy-scoped; secrets routes only
+— rows marked **master** reject agent keys). `GET /secrets/:name?wrap=true`
+returns a one-time `unwrap_url` instead of the value.
 
 Password minimum length at `/init` is 8 characters — you should use at least 20.
 
@@ -762,9 +854,12 @@ For `.env` changes that affect both services, omit the service name.
 
 ## Security notes & caveats
 
-- **Hobby-grade.** Uses PBKDF2, not Argon2id. Single-node, no replication,
-  no audit log, no secret rotation, no granular ACLs — one password unlocks
-  everything.
+- **Hobby-grade.** Uses PBKDF2, not Argon2id. Single-node, no replication.
+- **Policy enforcement is at the API layer, not cryptographic.** One DEK
+  encrypts all secrets; an agent key unwraps that DEK, and the per-secret
+  scoping is enforced by the server's policy checks (like HashiCorp Vault).
+  A memory-level compromise of the running process exposes everything —
+  the scoping protects against leaked/pasted keys, not a rooted host.
 - **2FA is optional but recommended.** When enabled, the TOTP secret is
   encrypted with the master password (same envelope scheme as the `vault-ok`
   canary) and stored in `vault.json`. A wrong password means TOTP never
@@ -798,13 +893,15 @@ For `.env` changes that affect both services, omit the service name.
 ├── Dockerfile                     node:20-alpine build for the vault
 ├── .env.example                   Template for VAULT_DOMAIN / ALLOWED_IPS / VAULT_NAME / VAULT_DESCRIPTION
 ├── package.json                   Dependencies: express + qrcode
-├── server.js                      The entire vault API + TOTP + shares (single file)
+├── server.js                      The entire vault API + agents + TOTP + shares + audit (single file)
 ├── public/                        Zero-build static web UI
 │   ├── index.html
 │   ├── styles.css
 │   └── app.js
-└── scripts/
-    └── setup-hardening.sh         Firewall + backup + CF-refresh automation
+├── scripts/
+│   └── setup-hardening.sh         Firewall + backup + CF-refresh automation
+└── test/
+    └── run-tests.sh               End-to-end API test suite (migration, agents, policies, audit)
 ```
 
 ## Contributing
